@@ -16,7 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── macOS ──
           - target: aarch64-apple-darwin
             os: macos-14
             artifact: cipher-cli-macos-arm64
@@ -25,27 +24,21 @@ jobs:
             os: macos-13
             artifact: cipher-cli-macos-x64
             ext: ""
-
-          # ── Linux ──
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             artifact: cipher-cli-linux-x64
             ext: ""
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             artifact: cipher-cli-linux-arm64
             ext: ""
             cross: true
-
-          # ── Windows ──
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: cipher-cli-windows-x64
             ext: ".exe"
-
-          # ── Android (aarch64) ──
           - target: aarch64-linux-android
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             artifact: cipher-cli-android-arm64
             ext: ""
             cross: true
@@ -76,11 +69,11 @@ jobs:
           key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (native)
-        if: "!matrix.cross"
+        if: ${{ !matrix.cross }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (cross)
-        if: matrix.cross
+        if: ${{ matrix.cross }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Package binary
@@ -143,25 +136,16 @@ jobs:
             | **Windows** | x86_64 | `cipher-cli-windows-x64.zip` |
             | **Android** | ARM64 | `cipher-cli-android-arm64.tar.gz` |
 
-            ### Quick Install (Mac/Linux)
+            ### Quick Install
             ```bash
             # macOS Apple Silicon
             curl -sSfL https://github.com/TokenKickstarter/Cipher-cli/releases/download/${{ github.ref_name }}/cipher-cli-macos-arm64.tar.gz | tar xz
-            chmod +x cipher-cli-macos-arm64
             sudo mv cipher-cli-macos-arm64 /usr/local/bin/cipher-cli
 
             # Linux x64
             curl -sSfL https://github.com/TokenKickstarter/Cipher-cli/releases/download/${{ github.ref_name }}/cipher-cli-linux-x64.tar.gz | tar xz
-            chmod +x cipher-cli-linux-x64
             sudo mv cipher-cli-linux-x64 /usr/local/bin/cipher-cli
             ```
-
-            ### Features
-            - 🔐 AES-256-GCM end-to-end encryption
-            - 📎 File transfer (images, video, documents)
-            - ⛓️ TKS Blockchain username registry
-            - 💬 Interactive chat mode
-            - 🌐 Connects to `wss://signal.tokenkickstarter.com`
           files: |
             artifacts/**/*.tar.gz
             artifacts/**/*.zip

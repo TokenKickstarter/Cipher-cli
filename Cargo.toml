@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core Cipher library (identity, encryption, transport, messaging)
-client-core = { path = "../client-core" }
+client-core = { path = "./client-core" }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
