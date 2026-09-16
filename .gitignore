@@ -1,0 +1,27 @@
+# Build artifacts
+/target/
+/releases/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Keys & secrets — NEVER commit these
+*.key
+*.pem
+*.p12
+*.pfx
+identity.json
+.cipher/
+
+# Test artifacts
+/tmp/
+cipher-test-*
+
+# Debug logs
+SYNC_DEBUG.txt
+*.log

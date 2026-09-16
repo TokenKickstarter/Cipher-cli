@@ -1,0 +1,116 @@
+[package]
+name = "client-core"
+version = "0.1.0"
+edition = "2021"
+description = "Cipher client core — identity, encryption, networking"
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# BIP-39 mnemonic
+bip39 = { version = "2.1", features = ["rand"] }
+bip32 = "0.5"
+
+# Ed25519 (chat signing + X3DH identity)
+ed25519-dalek = { version = "2.1", features = ["rand_core", "serde"] }
+
+# X25519 (Diffie-Hellman key exchange)
+x25519-dalek = { version = "2.0", features = ["serde", "static_secrets"] }
+
+# secp256k1 (EVM wallet)
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+secp256k1 = { version = "0.29", features = ["recovery", "global-context", "rand-std"] }
+
+# Sr25519 (Substrate account) via schnorrkel
+schnorrkel = { version = "0.11", features = ["serde"] }
+
+# AES-256-GCM symmetric encryption
+aes-gcm = "0.10"
+
+# HKDF key derivation + SHA-2
+hkdf = "0.12"
+sha2 = "0.10"
+
+# SHA-3 / Keccak (EVM address derivation)
+sha3 = "0.10"
+
+# TwoX hash (Substrate storage key prefix)
+twox-hash = "1.6"
+
+# Blake2 (SS58 checksum)
+blake2 = "0.10"
+
+# Base58 encoding (SS58 addresses)
+bs58 = "0.5"
+
+# HMAC for Double Ratchet KDF chains
+hmac = "0.12"
+
+# Secure random
+rand = "0.8"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Hex encoding
+hex = "0.4"
+
+# Base64 encoding (file chunker FFI)
+base64 = "0.22"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# HTTP client (lightweight, for TKS node JSON-RPC)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ureq = { version = "2", features = ["json"] }
+
+# WebSocket client (real-time signal relay)
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# SCALE codec (Substrate extrinsic encoding)
+parity-scale-codec = { version = "3", features = ["derive"] }
+
+# Secure memory (zero on drop)
+zeroize = { version = "1.8", features = ["derive"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1.0"
+
+# Async
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+
+# Networking (libp2p)
+libp2p = { version = "0.54", features = [
+  "tokio", "noise", "yamux", "tcp", "gossipsub", "kad",
+  "request-response", "identify", "dns", "macros", "serde"
+] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# UUID for message IDs
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Timestamp
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# Optimize all dependencies in debug mode — crypto libraries (PBKDF2, HMAC,
+# secp256k1, ed25519) are 10-50x slower without optimization. This only affects
+# dependencies, NOT our own code, so compile times stay fast.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Our own code also needs some optimization because PBKDF2 key derivation
+# runs in identity.rs. Level 1 gives most crypto speedup with minimal impact.
+[profile.dev]
+opt-level = 1
+

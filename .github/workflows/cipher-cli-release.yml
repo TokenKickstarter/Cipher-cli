@@ -1,0 +1,171 @@
+name: Cipher CLI — Release Builds
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── macOS ──
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: cipher-cli-macos-arm64
+            ext: ""
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: cipher-cli-macos-x64
+            ext: ""
+
+          # ── Linux ──
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            artifact: cipher-cli-linux-x64
+            ext: ""
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            artifact: cipher-cli-linux-arm64
+            ext: ""
+            cross: true
+
+          # ── Windows ──
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: cipher-cli-windows-x64
+            ext: ".exe"
+
+          # ── Android (aarch64) ──
+          - target: aarch64-linux-android
+            os: ubuntu-22.04
+            artifact: cipher-cli-android-arm64
+            ext: ""
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for cross-compilation)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Install Linux ARM64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --release --target ${{ matrix.target }}
+        working-directory: cipher-cli
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --target ${{ matrix.target }}
+        working-directory: cipher-cli
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          BIN="cipher-cli/target/${{ matrix.target }}/release/cipher-cli${{ matrix.ext }}"
+          cp "$BIN" "dist/${{ matrix.artifact }}${{ matrix.ext }}"
+          cd dist
+          if [[ "${{ matrix.ext }}" == ".exe" ]]; then
+            7z a "${{ matrix.artifact }}.zip" "${{ matrix.artifact }}${{ matrix.ext }}"
+          else
+            chmod +x "${{ matrix.artifact }}${{ matrix.ext }}"
+            tar czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}${{ matrix.ext }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec sha256sum {} \; | sort > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Cipher CLI ${{ github.ref_name }}
+          body: |
+            ## ⚔️ Cipher CLI ${{ github.ref_name }}
+
+            Encrypted messaging from the terminal, powered by TKS Blockchain.
+
+            ### Downloads
+
+            | Platform | Architecture | File |
+            |----------|-------------|------|
+            | **macOS** | Apple Silicon (M1/M2/M3) | `cipher-cli-macos-arm64.tar.gz` |
+            | **macOS** | Intel x64 | `cipher-cli-macos-x64.tar.gz` |
+            | **Linux** | x86_64 | `cipher-cli-linux-x64.tar.gz` |
+            | **Linux** | ARM64 | `cipher-cli-linux-arm64.tar.gz` |
+            | **Windows** | x86_64 | `cipher-cli-windows-x64.zip` |
+            | **Android** | ARM64 | `cipher-cli-android-arm64.tar.gz` |
+
+            ### Quick Install (Mac/Linux)
+            ```bash
+            # macOS Apple Silicon
+            curl -sSfL https://github.com/user/repo/releases/download/${{ github.ref_name }}/cipher-cli-macos-arm64.tar.gz | tar xz
+            chmod +x cipher-cli-macos-arm64
+            sudo mv cipher-cli-macos-arm64 /usr/local/bin/cipher-cli
+
+            # Linux x64
+            curl -sSfL https://github.com/user/repo/releases/download/${{ github.ref_name }}/cipher-cli-linux-x64.tar.gz | tar xz
+            chmod +x cipher-cli-linux-x64
+            sudo mv cipher-cli-linux-x64 /usr/local/bin/cipher-cli
+            ```
+
+            ### Features
+            - 🔐 AES-256-GCM end-to-end encryption
+            - 📎 File transfer (images, video, documents)
+            - ⛓️ TKS Blockchain username registry
+            - 💬 Interactive chat mode
+            - 🌐 Connects to `wss://signal.tokenkickstarter.com`
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip
+            artifacts/**/SHA256SUMS.txt
+          generate_release_notes: true
