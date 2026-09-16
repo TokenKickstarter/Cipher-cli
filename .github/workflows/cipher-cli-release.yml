@@ -78,18 +78,16 @@ jobs:
       - name: Build (native)
         if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }}
-        working-directory: cipher-cli
 
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
-        working-directory: cipher-cli
 
       - name: Package binary
         shell: bash
         run: |
           mkdir -p dist
-          BIN="cipher-cli/target/${{ matrix.target }}/release/cipher-cli${{ matrix.ext }}"
+          BIN="target/${{ matrix.target }}/release/cipher-cli${{ matrix.ext }}"
           cp "$BIN" "dist/${{ matrix.artifact }}${{ matrix.ext }}"
           cd dist
           if [[ "${{ matrix.ext }}" == ".exe" ]]; then
@@ -148,12 +146,12 @@ jobs:
             ### Quick Install (Mac/Linux)
             ```bash
             # macOS Apple Silicon
-            curl -sSfL https://github.com/user/repo/releases/download/${{ github.ref_name }}/cipher-cli-macos-arm64.tar.gz | tar xz
+            curl -sSfL https://github.com/TokenKickstarter/Cipher-cli/releases/download/${{ github.ref_name }}/cipher-cli-macos-arm64.tar.gz | tar xz
             chmod +x cipher-cli-macos-arm64
             sudo mv cipher-cli-macos-arm64 /usr/local/bin/cipher-cli
 
             # Linux x64
-            curl -sSfL https://github.com/user/repo/releases/download/${{ github.ref_name }}/cipher-cli-linux-x64.tar.gz | tar xz
+            curl -sSfL https://github.com/TokenKickstarter/Cipher-cli/releases/download/${{ github.ref_name }}/cipher-cli-linux-x64.tar.gz | tar xz
             chmod +x cipher-cli-linux-x64
             sudo mv cipher-cli-linux-x64 /usr/local/bin/cipher-cli
             ```
