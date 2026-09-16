@@ -34,7 +34,13 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
         .map_err(|e| format!("Send failed: {e}"))?;
 
     // Wait for the message to be flushed to the relay
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+    // The sync daemon flushes every 15s, but we need it NOW before exit
+    println!("{}", "  Flushing to relay...".dimmed());
+    let sender = client_core::transport::direct::DefaultSender {
+        direct: client.transport.direct.clone(),
+    };
+    client.transport.direct.flush_outbox(&sender).await;
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     println!();
     println!("{} Message sent!", "✅".green());
