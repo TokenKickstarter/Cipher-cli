@@ -6,6 +6,9 @@ use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
+    // Resolve @username → 0x address via TKS blockchain
+    let recipient = super::resolve::resolve_recipient(recipient)?;
+
     let password = identity_store::prompt_password("🔑 Password: ");
     let identity = identity_store::load_identity(&password)?;
 
@@ -26,7 +29,7 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     println!("{}", format!("Encrypting & sending to {}...", recipient).yellow());
 
     let msg_id = client
-        .send_text(recipient, message)
+        .send_text(&recipient, message)
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 

@@ -73,6 +73,9 @@ fn format_size(bytes: u64) -> String {
 }
 
 pub async fn run(recipient: &str, file_path: &str) -> Result<(), String> {
+    // Resolve @username → 0x address via TKS blockchain
+    let recipient = super::resolve::resolve_recipient(recipient)?;
+
     let path = Path::new(file_path);
 
     // Validate file exists
@@ -118,7 +121,7 @@ pub async fn run(recipient: &str, file_path: &str) -> Result<(), String> {
     println!("{}", format!("Encrypting & sending '{}' to {}...", file_name, recipient).yellow());
 
     let (msg_id, metadata) = client
-        .send_file(recipient, &file_data, file_name, mime_type)
+        .send_file(&recipient, &file_data, file_name, mime_type)
         .await
         .map_err(|e| format!("File send failed: {e}"))?;
 

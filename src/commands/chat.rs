@@ -8,11 +8,13 @@ use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run(peer: &str) -> Result<(), String> {
+    // Resolve @username → 0x address via TKS blockchain
+    let peer = super::resolve::resolve_recipient(peer)?;
+
     let password = identity_store::prompt_password("🔑 Password: ");
     let identity = identity_store::load_identity(&password)?;
 
     let our_addr = identity.evm_address();
-    let peer = peer.to_string();
 
     println!();
     println!("{}", "╔══════════════════════════════════════════════════╗".green().bold());

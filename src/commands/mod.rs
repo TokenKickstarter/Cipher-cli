@@ -12,3 +12,4 @@ pub mod register;
 pub mod lookup;
 pub mod balance;
 pub mod node_info;
+pub mod resolve;
