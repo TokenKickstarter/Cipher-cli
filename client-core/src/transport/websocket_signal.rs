@@ -124,17 +124,17 @@ impl WebSocketSignal {
         let mut backoff_ms: u64 = 1000;
         let max_backoff_ms: u64 = 30000;
 
-        // Allow up to 256MB WebSocket messages for large file transfers
-        let ws_config = WebSocketConfig {
-            max_message_size: Some(256 * 1024 * 1024),  // 256MB
-            max_frame_size: Some(64 * 1024 * 1024),     // 64MB per frame
-            ..Default::default()
-        };
-
         loop {
             let ws_url = format!("{}?addr={}", base_url, addr);
             info!("[WS] Connecting to {}...", ws_url);
             *state.write().await = WsState::Connecting;
+
+            // Allow up to 256MB WebSocket messages for large file transfers
+            let ws_config = WebSocketConfig {
+                max_message_size: Some(256 * 1024 * 1024),  // 256MB
+                max_frame_size: Some(64 * 1024 * 1024),     // 64MB per frame
+                ..Default::default()
+            };
 
             match connect_async_with_config(&ws_url, Some(ws_config), false).await {
                 Ok((ws_stream, _response)) => {

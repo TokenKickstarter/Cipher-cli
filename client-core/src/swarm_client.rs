@@ -117,7 +117,7 @@ impl SwarmClient {
         let transport_for_poll = self.transport.clone();
         crate::ffi::runtime().spawn(async move {
             // Give the transport a moment to initialise before first poll
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             loop {
                 let sender = crate::transport::direct::DefaultSender {
                     direct: transport_for_poll.direct.clone(),
@@ -127,7 +127,7 @@ impl SwarmClient {
                 // Also flush any queued outgoing messages
                 transport_for_poll.direct.flush_outbox(&sender).await;
 
-                tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
             }
         });
 
