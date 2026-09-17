@@ -182,28 +182,84 @@ impl WebSocketSignal {
                     while let Some(result) = ws_receiver.next().await {
                         match result {
                             Ok(Message::Text(text)) => {
-                                // Try to parse as an incoming signal
-                                if let Ok(incoming) = serde_json::from_str::<WsIncoming>(&text) {
-                                    debug!("[WS] 📬 Incoming signal from {}", incoming.from);
-                                    // Decode the base64 payload back to raw bytes
-                                    match base64_decode(&incoming.payload) {
-                                        Ok(bytes) => {
-                                            let _ = incoming_tx.send(bytes).await;
-                                            // Wake Dart instantly — zero-latency push!
-                                            crate::ffi::notify_dart();
+                                // Parse as generic JSON first to check the type
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                    let msg_type = json.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+                                    match msg_type {
+                                        // Relay v2: instant message push via WebSocket
+                                        "message" => {
+                                            if let Some(data_b64) = json.get("data").and_then(|d| d.as_str()) {
+                                                match base64_decode(data_b64) {
+                                                    Ok(bytes) => {
+                                                        info!("[WS] ⚡ Instant message received via WebSocket push!");
+                                                        let _ = incoming_tx.send(bytes).await;
+                                                        crate::ffi::notify_dart();
+
+                                                        // ACK the message so relay removes it from queue
+                                                        if let Some(mid) = json.get("message_id").and_then(|m| m.as_str()) {
+                                                            let ack_body = serde_json::json!({
+                                                                "recipient_id": addr,
+                                                                "message_ids": [mid],
+                                                            }).to_string();
+                                                            let ack_url = format!("{}/ack", "https://signal.tokenkickstarter.com");
+                                                            let _ = tokio::task::spawn_blocking(move || {
+                                                                ureq::post(&ack_url)
+                                                                    .set("Content-Type", "application/json")
+                                                                    .timeout(std::time::Duration::from_secs(5))
+                                                                    .send_string(&ack_body)
+                                                            }).await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[WS] Failed to decode WS push data: {}", e);
+                                                    }
+                                                }
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!("[WS] Failed to decode incoming payload: {}", e);
+
+                                        // Call signaling messages
+                                        "signal" => {
+                                            if let Some(payload) = json.get("payload").and_then(|p| p.as_str()) {
+                                                debug!("[WS] 📬 Incoming signal");
+                                                match base64_decode(payload) {
+                                                    Ok(bytes) => {
+                                                        let _ = incoming_tx.send(bytes).await;
+                                                        crate::ffi::notify_dart();
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[WS] Failed to decode signal payload: {}", e);
+                                                    }
+                                                }
+                                            }
                                         }
-                                    }
-                                } else if let Ok(ack) = serde_json::from_str::<WsAck>(&text) {
-                                    if let Some(err) = ack.error {
-                                        warn!("[WS] Server error: {}", err);
-                                    } else {
-                                        debug!(
-                                            "[WS] ACK: delivered={:?} queued={:?}",
-                                            ack.delivered, ack.queued
-                                        );
+
+                                        // ACK responses
+                                        _ => {
+                                            if let Ok(ack) = serde_json::from_str::<WsAck>(&text) {
+                                                if let Some(err) = ack.error {
+                                                    warn!("[WS] Server error: {}", err);
+                                                } else {
+                                                    debug!(
+                                                        "[WS] ACK: delivered={:?} queued={:?}",
+                                                        ack.delivered, ack.queued
+                                                    );
+                                                }
+                                            }
+                                            // Also try legacy WsIncoming format (no type field)
+                                            else if let Ok(incoming) = serde_json::from_str::<WsIncoming>(&text) {
+                                                debug!("[WS] 📬 Incoming signal from {}", incoming.from);
+                                                match base64_decode(&incoming.payload) {
+                                                    Ok(bytes) => {
+                                                        let _ = incoming_tx.send(bytes).await;
+                                                        crate::ffi::notify_dart();
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("[WS] Failed to decode incoming payload: {}", e);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
