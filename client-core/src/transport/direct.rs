@@ -154,7 +154,7 @@ impl DirectTransport {
         let (incoming_tx, incoming_rx) = mpsc::channel(1000);
         // Route through Cloudflare Worker HTTPS proxy for domain fronting.
         // ISPs see traffic to Cloudflare, not the VPS. WAF requires JSON content-type.
-        let relay_url = "http://34.9.66.172:4002".to_string();
+        let relay_url = "http://signal.tokenkickstarter.com:4002".to_string();
 
         Self {
             peer_id,

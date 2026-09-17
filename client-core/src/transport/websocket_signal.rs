@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 
 /// The default Cloudflare Signal Relay WebSocket URL.
-pub const DEFAULT_SIGNAL_WS_URL: &str = "ws://34.9.66.172:4002/ws";
+pub const DEFAULT_SIGNAL_WS_URL: &str = "ws://signal.tokenkickstarter.com:4002/ws";
 
 /// PRIVACY: Derive a sealed mailbox ID from an address.
 /// The relay only sees this hash, never the real address.
