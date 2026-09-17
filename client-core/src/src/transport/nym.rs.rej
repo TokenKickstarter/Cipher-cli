@@ -1,0 +1,44 @@
+@@ -124,14 +124,37 @@
+         }
+ 
+-        // Actually initialize the Nym Mixnet Client
+-        let mut disconnected_client = match MixnetClientBuilder::new_ephemeral().build() {
+-            Ok(c) => c,
+-            Err(e) => {
+-                let err_msg = format!("Failed to build Nym client: {}", e);
++        let build_task = tokio::task::spawn_blocking(|| {
++            std::panic::catch_unwind(|| {
++                MixnetClientBuilder::new_ephemeral().build()
++            })
++        });
++
++        let mut disconnected_client = match tokio::time::timeout(std::time::Duration::from_secs(10), build_task).await {
++            Ok(Ok(Ok(Ok(c)))) => c,
++            Ok(Ok(Ok(Err(e)))) => {
++                let err_msg = format!("Build error: {}", e);
+                 *self.state.write().await = NymState::Failed(err_msg.clone());
+                 crate::ffi::notify_dart();
+                 return Err(CipherError::Network(err_msg));
+             }
++            Ok(Ok(Err(panic_err))) => {
++                let msg = if let Some(s) = panic_err.downcast_ref::<&str>() { s.to_string() } else if let Some(s) = panic_err.downcast_ref::<String>() { s.clone() } else { "Unknown Panic".to_string() };
++                let err_msg = format!("PANIC in Nym Build: {}", msg);
++                *self.state.write().await = NymState::Failed(err_msg.clone());
++                crate::ffi::notify_dart();
++                return Err(CipherError::Network(err_msg));
++            }
++            Ok(Err(_)) => {
++                let err_msg = "Tokio spawn_blocking failed for Nym build".to_string();
++                *self.state.write().await = NymState::Failed(err_msg.clone());
++                crate::ffi::notify_dart();
++                return Err(CipherError::Network(err_msg));
++            }
++            Err(_) => {
++                let err_msg = "Timeout 10s: Nym blocked synchronously during build!".to_string();
++                *self.state.write().await = NymState::Failed(err_msg.clone());
++                crate::ffi::notify_dart();
++                return Err(CipherError::Network(err_msg));
++            }
+         };
+ 
+-        let connect_future = disconnected_client.connect_to_mixnet();
