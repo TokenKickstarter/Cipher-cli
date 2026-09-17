@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Core Cipher library (identity, encryption, transport, messaging)
-client-core = { path = "./client-core" }
+client-core = { path = "../client-core" }
 
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
@@ -46,6 +46,12 @@ rand = "0.8"
 
 # Timestamp display
 chrono = "0.4"
+
+# Hidden password input
+rpassword = "5"
+
+# Progress spinners
+indicatif = "0.17"
 
 # HTTP client (for direct RPC calls in balance command)
 ureq = { version = "2", features = ["json"] }

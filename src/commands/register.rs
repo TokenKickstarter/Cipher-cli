@@ -5,8 +5,7 @@ use client_core::username_registry::{UsernameRegistry, RegistryBackend, Username
 use crate::identity_store;
 
 pub async fn run(username: &str) -> Result<(), String> {
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
+    let identity = identity_store::get_identity()?;
 
     let our_addr = identity.evm_address();
     let clean_name = username.trim_start_matches('@').to_lowercase();

@@ -11,22 +11,28 @@ pub async fn run(peer: &str) -> Result<(), String> {
     // Resolve @username → 0x address via TKS blockchain
     let peer = super::resolve::resolve_recipient(peer)?;
 
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
-
+    let identity = identity_store::get_identity()?;
     let our_addr = identity.evm_address();
 
-    println!();
-    println!("{}", "╔══════════════════════════════════════════════════╗".green().bold());
-    println!("{}", "║             Interactive Chat Mode                ║".green().bold());
-    println!("{}", "╚══════════════════════════════════════════════════╝".green().bold());
-    println!();
-    println!("  {} {}", "You: ".dimmed(), our_addr.cyan());
-    println!("  {} {}", "Peer:".dimmed(), peer.cyan().bold());
-    println!("  {} {}", "Exit:".dimmed(), "Type /quit or Ctrl+C".dimmed());
-    println!("  {} {}", "E2EE:".dimmed(), "AES-256-GCM ✓".green());
-    println!();
-    println!("{}", "─".repeat(52).dimmed());
+    let peer_short = if peer.len() > 10 {
+        format!("{}...{}", &peer[..6], &peer[peer.len()-4..])
+    } else {
+        peer.clone()
+    };
+    let our_short = if our_addr.len() > 10 {
+        format!("{}...{}", &our_addr[..6], &our_addr[our_addr.len()-4..])
+    } else {
+        our_addr.clone()
+    };
+
+    println!("  ┌─────────────────────────────────────────────┐");
+    println!("  │  {}                     │", "Interactive Chat".white().bold());
+    println!("  ├─────────────────────────────────────────────┤");
+    println!("  │  {} {}               │", "You: ".dimmed(), our_short.cyan());
+    println!("  │  {} {}               │", "Peer:".dimmed(), peer_short.cyan().bold());
+    println!("  │  {} {}                      │", "E2EE:".dimmed(), "AES-256-GCM ✓".green());
+    println!("  │  {} {}           │", "Exit:".dimmed(), "/quit or Ctrl+C".dimmed());
+    println!("  └─────────────────────────────────────────────┘");
     println!();
 
     let client = Arc::new(SwarmClient::new(identity));
@@ -35,6 +41,11 @@ pub async fn run(peer: &str) -> Result<(), String> {
 
     // Wait for transport to connect
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    println!("  {} Connected to relay", "✓".green());
+    println!();
+    print!("  {} ", "▶".green().bold());
+    let _ = io::stdout().flush();
 
     // Spawn a background task to poll & display incoming messages
     let client_recv = client.clone();
@@ -45,20 +56,50 @@ pub async fn run(peer: &str) -> Result<(), String> {
             let messages = client_recv.receive_all().await;
 
             for msg in &messages {
-                // Only show messages from our chat peer
                 if msg.sender.to_lowercase() == peer_recv.to_lowercase() {
-                    if let MessageType::Text = &msg.msg_type {
-                        let text = String::from_utf8_lossy(&msg.payload);
-                        let time = msg.timestamp.format("%H:%M:%S");
-                        // Move cursor, print message, re-show prompt
-                        println!(
-                            "\r  {} {} {}",
-                            format!("[{}]", time).dimmed(),
-                            "◀".cyan().bold(),
-                            text.white()
-                        );
-                        print!("{}", "  ▶ ".green().bold());
-                        let _ = io::stdout().flush();
+                    let time = msg.timestamp.format("%H:%M:%S");
+                    match &msg.msg_type {
+                        MessageType::Text => {
+                            let text = String::from_utf8_lossy(&msg.payload);
+                            print!("\r{}", " ".repeat(60)); // Clear current line
+                            println!(
+                                "\r  {} {} {}",
+                                format!("[{}]", time).dimmed(),
+                                "◀".cyan().bold(),
+                                text.white()
+                            );
+                            print!("  {} ", "▶".green().bold());
+                            let _ = io::stdout().flush();
+                        }
+                        MessageType::File(meta) => {
+                            print!("\r{}", " ".repeat(60));
+                            println!(
+                                "\r  {} {} 📎 {} ({})",
+                                format!("[{}]", time).dimmed(),
+                                "◀".cyan().bold(),
+                                meta.file_name.yellow(),
+                                format!("{} bytes", meta.size_bytes).dimmed(),
+                            );
+
+                            // Auto-save file
+                            let download_dir = dirs::download_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join("cipher-files");
+                            std::fs::create_dir_all(&download_dir).ok();
+                            let safe_name = meta.file_name.replace('/', "_").replace('\\', "_");
+                            let dest = download_dir.join(&safe_name);
+                            if let Ok(_) = std::fs::write(&dest, &msg.payload) {
+                                println!(
+                                    "  {} {}",
+                                    "  💾 Saved:".green(),
+                                    dest.display().to_string().dimmed(),
+                                );
+                            }
+
+                            print!("  {} ", "▶".green().bold());
+                            let _ = io::stdout().flush();
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -67,7 +108,7 @@ pub async fn run(peer: &str) -> Result<(), String> {
         }
     });
 
-    // Main input loop — read lines from stdin and send
+    // Main input loop
     let stdin = io::stdin();
     let reader = stdin.lock();
 
@@ -76,15 +117,35 @@ pub async fn run(peer: &str) -> Result<(), String> {
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
-            print!("{}", "  ▶ ".green().bold());
+            print!("  {} ", "▶".green().bold());
             let _ = io::stdout().flush();
             continue;
         }
 
-        if trimmed == "/quit" || trimmed == "/exit" || trimmed == "/q" {
-            println!();
-            println!("{}", "👋 Chat ended.".yellow());
-            break;
+        match trimmed {
+            "/quit" | "/exit" | "/q" => {
+                println!();
+                println!("  {} Chat ended.", "👋".yellow());
+                break;
+            }
+            "/help" | "/h" => {
+                println!();
+                println!("  {}", "Commands:".white().bold());
+                println!("  {} {}", "/quit".cyan(), "— End the chat".dimmed());
+                println!("  {} {}", "/help".cyan(), "— Show this help".dimmed());
+                println!("  {} {}", "/clear".cyan(), "— Clear the screen".dimmed());
+                println!();
+                print!("  {} ", "▶".green().bold());
+                let _ = io::stdout().flush();
+                continue;
+            }
+            "/clear" | "/cls" => {
+                print!("\x1b[2J\x1b[H"); // ANSI clear screen
+                print!("  {} ", "▶".green().bold());
+                let _ = io::stdout().flush();
+                continue;
+            }
+            _ => {}
         }
 
         // Send the message
@@ -103,7 +164,7 @@ pub async fn run(peer: &str) -> Result<(), String> {
             }
         }
 
-        print!("{}", "  ▶ ".green().bold());
+        print!("  {} ", "▶".green().bold());
         let _ = io::stdout().flush();
     }
 

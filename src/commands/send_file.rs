@@ -104,8 +104,7 @@ pub async fn run(recipient: &str, file_path: &str) -> Result<(), String> {
     println!("  {} {}", "Encrypt: ".dimmed(), "AES-256-GCM per chunk ✓".green());
     println!();
 
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
+    let identity = identity_store::get_identity()?;
 
     let our_addr = identity.evm_address();
     println!("{}", format!("Sending as {}...", our_addr).dimmed());

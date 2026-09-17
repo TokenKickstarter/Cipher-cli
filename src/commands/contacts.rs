@@ -6,8 +6,7 @@ use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run() -> Result<(), String> {
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
+    let identity = identity_store::get_identity()?;
 
     let client = Arc::new(SwarmClient::new(identity));
     let client_clone = client.clone();

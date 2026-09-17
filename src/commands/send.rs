@@ -9,16 +9,19 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     // Resolve @username → 0x address via TKS blockchain
     let recipient = super::resolve::resolve_recipient(recipient)?;
 
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
-
+    let identity = identity_store::get_identity()?;
     let our_addr = identity.evm_address();
-    println!("{}", format!("Sending as {}...", our_addr).dimmed());
+
+    let recipient_short = if recipient.len() > 10 {
+        format!("{}...{}", &recipient[..6], &recipient[recipient.len()-4..])
+    } else {
+        recipient.clone()
+    };
+
+    println!("  {} Sending as {}...", "↑".dimmed(), our_addr[..10].to_string().dimmed());
 
     // Create SwarmClient with the identity
     let client = Arc::new(SwarmClient::new(identity));
-
-    // Start the transport (connects to relay)
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
 
@@ -26,16 +29,12 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     // Send the message
-    println!("{}", format!("Encrypting & sending to {}...", recipient).yellow());
-
     let msg_id = client
         .send_text(&recipient, message)
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
-    // Wait for the message to be flushed to the relay
-    // The sync daemon flushes every 15s, but we need it NOW before exit
-    println!("{}", "  Flushing to relay...".dimmed());
+    // Force flush outbox to relay before exit
     let sender = client_core::transport::direct::DefaultSender {
         direct: client.transport.direct.clone(),
     };
@@ -43,10 +42,10 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     println!();
-    println!("{} Message sent!", "✅".green());
-    println!("  {} {}", "To:        ".dimmed(), recipient.cyan());
-    println!("  {} {}", "Message ID:".dimmed(), msg_id.to_string().dimmed());
-    println!("  {} {}", "Encrypted: ".dimmed(), "AES-256-GCM ✓".green());
+    println!("  {} Message sent!", "✓".green().bold());
+    println!("    {} {}", "To:".dimmed(), recipient_short.cyan());
+    println!("    {} {}", "ID:".dimmed(), msg_id.to_string()[..8].to_string().dimmed());
+    println!("    {} {}", "🔐".dimmed(), "AES-256-GCM encrypted".green());
     println!();
 
     Ok(())

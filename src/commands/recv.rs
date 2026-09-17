@@ -7,11 +7,15 @@ use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run(follow: bool, interval: u64) -> Result<(), String> {
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
+    let identity = identity_store::get_identity()?;
 
     let our_addr = identity.evm_address();
-    println!("{}", format!("Listening as {}...", our_addr).dimmed());
+    let short = if our_addr.len() > 10 {
+        format!("{}...{}", &our_addr[..6], &our_addr[our_addr.len()-4..])
+    } else {
+        our_addr
+    };
+    println!("  {} Listening as {}...", "📡".dimmed(), short.cyan());
 
     let client = Arc::new(SwarmClient::new(identity));
     let client_clone = client.clone();

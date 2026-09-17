@@ -3,6 +3,7 @@
 //! Persists Cipher identity to disk with password-based encryption.
 //! Stored at `~/.cipher/identity.json` as AES-256-GCM encrypted data.
 
+use colored::Colorize;
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Nonce,
@@ -142,14 +143,9 @@ pub fn load_identity(password: &str) -> Result<CipherIdentity, String> {
         .map_err(|e| format!("Failed to restore identity: {e}"))
 }
 
-/// Prompt for a password from stdin (hides input on supported terminals)
+/// Prompt for a password from stdin (hides input)
 pub fn prompt_password(prompt: &str) -> String {
-    eprint!("{}", prompt);
-    let mut password = String::new();
-    std::io::stdin()
-        .read_line(&mut password)
-        .expect("Failed to read password");
-    password.trim().to_string()
+    rpassword::prompt_password_stderr(prompt).unwrap_or_default()
 }
 
 /// Prompt for a new password with confirmation
@@ -164,3 +160,29 @@ pub fn prompt_new_password() -> Result<String, String> {
     }
     Ok(p1)
 }
+
+/// Smart identity loader: tries session first, falls back to password prompt.
+/// This is the primary entry point for all commands that need an identity.
+pub fn get_identity() -> Result<CipherIdentity, String> {
+    // 1. Try loading from active session
+    if crate::session::is_session_active() {
+        match crate::session::load_from_session() {
+            Ok(identity) => return Ok(identity),
+            Err(_) => {
+                // Session corrupted, fall through to password
+            }
+        }
+    }
+
+    // 2. No session — prompt for password
+    let password = prompt_password("🔑 Password: ");
+    let identity = load_identity(&password)?;
+
+    // 3. Auto-create session so they don't need password again
+    if let Err(e) = crate::session::create_session(&identity) {
+        eprintln!("  {} {}", "⚠".yellow(), format!("Could not create session: {e}").dimmed());
+    }
+
+    Ok(identity)
+}
+

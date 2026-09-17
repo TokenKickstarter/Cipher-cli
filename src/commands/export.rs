@@ -11,8 +11,7 @@ pub async fn run() -> Result<(), String> {
     println!("{}", "╚══════════════════════════════════════════════════╝".red().bold());
     println!();
 
-    let password = identity_store::prompt_password("🔑 Password: ");
-    let identity = identity_store::load_identity(&password)?;
+    let identity = identity_store::get_identity()?;
 
     println!();
     println!("{}", "Your Seed Phrase:".yellow().bold());

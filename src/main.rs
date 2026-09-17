@@ -3,6 +3,7 @@ use colored::Colorize;
 
 mod commands;
 mod identity_store;
+mod session;
 
 /// Cipher CLI — Send & receive E2EE messages from the terminal
 ///
@@ -11,7 +12,7 @@ mod identity_store;
 /// Powered by the TKS blockchain for identity, usernames, and tokenomics.
 #[derive(Parser)]
 #[command(name = "cipher-cli")]
-#[command(version = "0.1.0")]
+#[command(version = "0.2.0")]
 #[command(about = "⚔️  Cipher CLI — Encrypted messaging from the terminal", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -41,6 +42,12 @@ enum Commands {
 
     /// Export your seed phrase (use with caution!)
     Export,
+
+    /// Unlock your identity (no password needed for 4 hours)
+    Login,
+
+    /// Lock your identity (destroy session)
+    Logout,
 
     // ── Messaging ─────────────────────────────────────────
 
@@ -117,20 +124,32 @@ enum Commands {
 }
 
 fn print_banner() {
-    let banner = r#"
-   ╔═══════════════════════════════════════════╗
-   ║          ⚔️  CIPHER CLI  ⚔️               ║
-   ║     Decentralized • Anonymous • E2EE      ║
-   ║       Powered by TKS Blockchain           ║
-   ╚═══════════════════════════════════════════╝
-"#;
-    println!("{}", banner.cyan());
+    println!();
+    println!("  {} {}", "⚔️ ".bold(), "CIPHER CLI".cyan().bold());
+    println!("  {}", "Decentralized • Anonymous • E2EE".dimmed());
+    if session::is_session_active() {
+        if let Some(addr) = session::session_address() {
+            let remaining = session::session_remaining_secs().unwrap_or(0);
+            let hours = remaining / 3600;
+            let mins = (remaining % 3600) / 60;
+            let short_addr = if addr.len() > 10 {
+                format!("{}...{}", &addr[..6], &addr[addr.len()-4..])
+            } else {
+                addr
+            };
+            println!("  {} {} {}", "🔓".green(), short_addr.green(), format!("({}h {}m left)", hours, mins).dimmed());
+        }
+    } else {
+        println!("  {}", "🔒 Locked — run `cipher-cli login` to unlock".dimmed());
+    }
+    println!();
 }
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging (set RUST_LOG=debug for verbose output)
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+    // Default to WARN level to suppress noisy transport/crypto logs
+    // Users can set RUST_LOG=info or RUST_LOG=debug for verbose output
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .format_timestamp_secs()
         .init();
 
@@ -152,6 +171,12 @@ async fn main() {
         }
         Commands::Export => {
             commands::export::run().await
+        }
+        Commands::Login => {
+            run_login().await
+        }
+        Commands::Logout => {
+            run_logout().await
         }
 
         // Messaging
@@ -191,7 +216,53 @@ async fn main() {
     };
 
     if let Err(e) = result {
-        eprintln!("{} {}", "Error:".red().bold(), e);
+        eprintln!("  {} {}", "✗".red().bold(), e);
         std::process::exit(1);
     }
+}
+
+/// `cipher-cli login` — Unlock identity for 4 hours
+async fn run_login() -> Result<(), String> {
+    if session::is_session_active() {
+        let remaining = session::session_remaining_secs().unwrap_or(0);
+        let hours = remaining / 3600;
+        let mins = (remaining % 3600) / 60;
+        println!("  {} Already logged in ({}h {}m remaining)", "✓".green(), hours, mins);
+        println!("  {}", "Run `cipher-cli logout` to lock.".dimmed());
+        return Ok(());
+    }
+
+    let password = identity_store::prompt_password("  🔑 Password: ");
+    let identity = identity_store::load_identity(&password)?;
+
+    session::create_session(&identity)?;
+
+    let addr = identity.evm_address();
+    let short = if addr.len() > 10 {
+        format!("{}...{}", &addr[..6], &addr[addr.len()-4..])
+    } else {
+        addr
+    };
+
+    println!();
+    println!("  {} Unlocked as {}", "✓".green().bold(), short.cyan());
+    println!("  {} Session active for 4 hours", "⏱".dimmed());
+    println!("  {} No password needed for subsequent commands", "💡".dimmed());
+    println!();
+
+    Ok(())
+}
+
+/// `cipher-cli logout` — Destroy active session
+async fn run_logout() -> Result<(), String> {
+    if !session::is_session_active() {
+        println!("  {} Not logged in.", "ℹ".dimmed());
+        return Ok(());
+    }
+
+    session::destroy_session()?;
+    println!("  {} Session destroyed. Identity locked.", "🔒".yellow());
+    println!();
+
+    Ok(())
 }

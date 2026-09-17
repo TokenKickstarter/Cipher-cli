@@ -9,8 +9,7 @@ pub async fn run(address: Option<&str>) -> Result<(), String> {
     let (query_addr, is_own) = if let Some(addr) = address {
         (addr.to_string(), false)
     } else {
-        let password = identity_store::prompt_password("🔑 Password: ");
-        let identity = identity_store::load_identity(&password)?;
+    let identity = identity_store::get_identity()?;
         (identity.evm_address(), true)
     };
 
