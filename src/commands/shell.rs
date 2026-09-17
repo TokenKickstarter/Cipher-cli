@@ -72,7 +72,7 @@ pub async fn run() -> Result<(), String> {
             let messages = client_recv.receive_all().await;
 
             for msg in &messages {
-                let time = msg.timestamp.format("%H:%M:%S");
+                let time = msg.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S");
                 let sender_short = if msg.sender.len() > 10 {
                     format!("{}...{}", &msg.sender[..6], &msg.sender[msg.sender.len()-4..])
                 } else {
@@ -96,7 +96,7 @@ pub async fn run() -> Result<(), String> {
                 match &msg.msg_type {
                     MessageType::Text => {
                         let text = String::from_utf8_lossy(&msg.payload);
-                        print!("\r{}", " ".repeat(70)); // Clear line
+                        print!("\x1b[2K\r"); // Clear entire line
                         println!(
                             "\r  {} {} {} {}",
                             format!("[{}]", time).dimmed(),
@@ -128,7 +128,7 @@ pub async fn run() -> Result<(), String> {
                         let dest = download_dir.join(&safe_name);
                         let _ = std::fs::write(&dest, &msg.payload);
 
-                        print!("\r{}", " ".repeat(70));
+                        print!("\x1b[2K\r");
                         println!(
                             "\r  {} {} {} 📎 {} ({})",
                             format!("[{}]", time).dimmed(),
@@ -380,14 +380,13 @@ pub async fn run() -> Result<(), String> {
 
             match client.send_text(&resolved, message).await {
                 Ok(_) => {
-                    let time = chrono::Utc::now().format("%H:%M:%S");
+                    let time = chrono::Local::now().format("%H:%M:%S");
+                    print!("\x1b[A\x1b[2K\r"); // Move up to overwrite stdin echo
                     println!(
-                        "  {} {} {} {} {}",
+                        "  {} {} {}",
                         format!("[{}]", time).dimmed(),
-                        display.green(),
                         "▶".green().bold(),
                         message.white(),
-                        "✓".green(),
                     );
                 }
                 Err(e) => {
@@ -415,7 +414,8 @@ pub async fn run() -> Result<(), String> {
         if let Some(ref peer_addr) = fp {
             match client.send_text(peer_addr, trimmed).await {
                 Ok(_) => {
-                    let time = chrono::Utc::now().format("%H:%M:%S");
+                    let time = chrono::Local::now().format("%H:%M:%S");
+                    print!("\x1b[A\x1b[2K\r"); // Move up to overwrite stdin echo
                     println!(
                         "  {} {} {}",
                         format!("[{}]", time).dimmed(),
