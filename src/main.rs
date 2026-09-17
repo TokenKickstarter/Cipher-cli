@@ -16,11 +16,16 @@ mod session;
 #[command(about = "⚔️  Cipher CLI — Encrypted messaging from the terminal", long_about = None)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    // ── Interactive ───────────────────────────────────────
+
+    /// Open interactive chat shell (unified inbox)
+    Shell,
+
     // ── Identity ──────────────────────────────────────────
 
     /// Generate a new identity (BIP-39 seed phrase → all keypairs)
@@ -158,59 +163,64 @@ async fn main() {
     print_banner();
 
     let result = match cli.command {
+        // No subcommand → interactive shell
+        None | Some(Commands::Shell) => {
+            commands::shell::run().await
+        }
+
         // Identity
-        Commands::Init { words24 } => {
+        Some(Commands::Init { words24 }) => {
             commands::init::run(words24).await
         }
-        Commands::Restore { seed_phrase } => {
+        Some(Commands::Restore { seed_phrase }) => {
             let phrase = seed_phrase.join(" ");
             commands::restore::run(&phrase).await
         }
-        Commands::Whoami => {
+        Some(Commands::Whoami) => {
             commands::whoami::run().await
         }
-        Commands::Export => {
+        Some(Commands::Export) => {
             commands::export::run().await
         }
-        Commands::Login => {
+        Some(Commands::Login) => {
             run_login().await
         }
-        Commands::Logout => {
+        Some(Commands::Logout) => {
             run_logout().await
         }
 
         // Messaging
-        Commands::Send { recipient, message } => {
+        Some(Commands::Send { recipient, message }) => {
             let msg = message.join(" ");
             commands::send::run(&recipient, &msg).await
         }
-        Commands::SendFile { recipient, file } => {
+        Some(Commands::SendFile { recipient, file }) => {
             commands::send_file::run(&recipient, &file).await
         }
-        Commands::Recv { follow, interval } => {
+        Some(Commands::Recv { follow, interval }) => {
             commands::recv::run(follow, interval).await
         }
-        Commands::Chat { peer } => {
+        Some(Commands::Chat { peer }) => {
             commands::chat::run(&peer).await
         }
-        Commands::Contacts => {
+        Some(Commands::Contacts) => {
             commands::contacts::run().await
         }
-        Commands::Status => {
+        Some(Commands::Status) => {
             commands::status::run().await
         }
 
         // TKS Blockchain
-        Commands::Register { username } => {
+        Some(Commands::Register { username }) => {
             commands::register::run(&username).await
         }
-        Commands::Lookup { query } => {
+        Some(Commands::Lookup { query }) => {
             commands::lookup::run(&query).await
         }
-        Commands::Balance { address } => {
+        Some(Commands::Balance { address }) => {
             commands::balance::run(address.as_deref()).await
         }
-        Commands::NodeInfo => {
+        Some(Commands::NodeInfo) => {
             commands::node_info::run().await
         }
     };
