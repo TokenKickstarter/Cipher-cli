@@ -68,6 +68,16 @@ pub struct SwarmClient {
     peer_presence: Arc<RwLock<HashMap<String, PeerPresence>>>,
     /// Whether this user has opted into online presence broadcasting
     pub presence_enabled: Arc<RwLock<bool>>,
+    /// File chunk reassembly buffer: file_id → (sender, expected_total, collected_chunks)
+    chunk_buffer: Arc<RwLock<HashMap<String, ChunkAssembly>>>,
+}
+
+/// In-progress file chunk assembly
+struct ChunkAssembly {
+    sender: String,
+    total_chunks: u32,
+    chunks: HashMap<u32, Vec<u8>>,  // chunk_index → decrypted data
+    header_msg: Option<CipherMessage>, // The File header message
 }
 
 impl SwarmClient {
@@ -87,6 +97,7 @@ impl SwarmClient {
             seen_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
             peer_presence: Arc::new(RwLock::new(HashMap::new())),
             presence_enabled: Arc::new(RwLock::new(true)),
+            chunk_buffer: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -171,6 +182,7 @@ impl SwarmClient {
             seen_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
             peer_presence: Arc::new(RwLock::new(HashMap::new())),
             presence_enabled: Arc::new(RwLock::new(true)),
+            chunk_buffer: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -250,12 +262,17 @@ impl SwarmClient {
         mime_type: &str,
     ) -> Result<(MessageId, crate::message::FileMetadata), CipherError> {
         let session_key = self.derive_temp_session_key(recipient);
+        let our_addr = self.our_address();
+
+        const CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB per chunk
+        let total_chunks = ((file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE).max(1) as u32;
+        let file_id = uuid::Uuid::new_v4().to_string();
 
         let metadata = crate::message::FileMetadata {
             file_name: file_name.to_string(),
             mime_type: mime_type.to_string(),
             size_bytes: file_data.len() as u64,
-            total_chunks: 1,
+            total_chunks,
             merkle_root: {
                 use sha2::{Sha256, Digest};
                 let mut h = Sha256::new();
@@ -268,33 +285,60 @@ impl SwarmClient {
             thumbnail: None,
         };
 
-        // Encrypt the ACTUAL file data (not just metadata)
-        let encrypted = aes_encrypt(&session_key, file_data)?;
+        // 1. Send file header (metadata only, small message)
+        let header_payload = serde_json::to_vec(&serde_json::json!({
+            "file_id": file_id,
+            "metadata": metadata,
+        })).map_err(|e| CipherError::File(format!("Metadata serialization: {e}")))?;
+        let encrypted_header = aes_encrypt(&session_key, &header_payload)?;
 
-        let our_addr = self.our_address();
-        let msg = CipherMessage {
+        let header_msg = CipherMessage {
             id: uuid::Uuid::new_v4(),
             sender: our_addr.clone(),
             recipient: recipient.to_string(),
             msg_type: MessageType::File(metadata.clone()),
             timestamp: chrono::Utc::now(),
-            payload: encrypted.ciphertext,
-            nonce: encrypted.nonce,
+            payload: encrypted_header.ciphertext,
+            nonce: encrypted_header.nonce,
             dh_public: [0u8; 32],
             counter: 0,
             ttl: 30 * 86400,
         };
 
-        let msg_id = msg.id;
-        let data = msg.to_bytes();
-
-        // Send via transport and flush immediately
+        let header_id = header_msg.id;
+        let data = header_msg.to_bytes();
         self.transport.queue_message(recipient, data).await?;
+        self.sent_log.write().await.insert(header_id, header_msg);
+
+        // 2. Send each chunk as a separate, independently encrypted message
+        for (i, chunk_data) in file_data.chunks(CHUNK_SIZE).enumerate() {
+            let encrypted_chunk = aes_encrypt(&session_key, chunk_data)?;
+
+            let chunk_msg = CipherMessage {
+                id: uuid::Uuid::new_v4(),
+                sender: our_addr.clone(),
+                recipient: recipient.to_string(),
+                msg_type: MessageType::FileChunk {
+                    file_id: file_id.clone(),
+                    chunk_index: i as u32,
+                    total_chunks,
+                },
+                timestamp: chrono::Utc::now(),
+                payload: encrypted_chunk.ciphertext,
+                nonce: encrypted_chunk.nonce,
+                dh_public: [0u8; 32],
+                counter: i as u64,
+                ttl: 30 * 86400,
+            };
+
+            let data = chunk_msg.to_bytes();
+            self.transport.queue_message(recipient, data).await?;
+        }
+
+        // 3. Flush all messages immediately
         self.transport.direct.flush_outbox(&crate::transport::direct::DefaultSender {
             direct: self.transport.direct.clone(),
         }).await;
-
-        self.sent_log.write().await.insert(msg_id, msg);
 
         // Track in conversation
         let mut conversations = self.conversations.write().await;
@@ -305,17 +349,15 @@ impl SwarmClient {
             statuses: HashMap::new(),
             unread: 0,
         });
-        conv.message_ids.push(msg_id);
-        conv.statuses.insert(msg_id, DeliveryStatus::Queued);
+        conv.message_ids.push(header_id);
+        conv.statuses.insert(header_id, DeliveryStatus::Queued);
 
         info!(
-            "File '{}' ({} bytes) sent to {}",
-            file_name,
-            file_data.len(),
-            recipient
+            "File '{}' ({} bytes, {} chunks) sent to {}",
+            file_name, file_data.len(), total_chunks, recipient
         );
 
-        Ok((msg_id, metadata))
+        Ok((header_id, metadata))
     }
 
     pub async fn send_webrtc_media(&self, recipient: &str, media_bytes: Vec<u8>) -> Result<MessageId, CipherError> {
@@ -487,6 +529,121 @@ impl SwarmClient {
                             info!("Presence update from {}: online={}", sender, presence_info.is_online);
                             // Presence is NOT added to inbox — it is an internal system message
                             continue;
+                        }
+                        MessageType::FileChunk { ref file_id, chunk_index, total_chunks } => {
+                            let ci: u32 = *chunk_index;
+                            let tc: u32 = *total_chunks;
+                            // Store chunk in buffer, assemble when complete
+                            let mut buf = self.chunk_buffer.write().await;
+                            let assembly = buf.entry(file_id.clone()).or_insert_with(|| ChunkAssembly {
+                                sender: sender.clone(),
+                                total_chunks: tc,
+                                chunks: HashMap::new(),
+                                header_msg: None,
+                            });
+                            assembly.chunks.insert(ci, msg.payload.clone());
+                            info!("Chunk {}/{} for file {} from {}", ci + 1, tc, file_id, sender);
+
+                            // Check if all chunks arrived
+                            if assembly.chunks.len() == tc as usize {
+                                // Reassemble file
+                                let mut file_data = Vec::new();
+                                for i in 0..tc {
+                                    if let Some(chunk) = assembly.chunks.get(&i) {
+                                        file_data.extend_from_slice(chunk);
+                                    }
+                                }
+                                let assembled_sender = assembly.sender.clone();
+                                let header = assembly.header_msg.take();
+                                buf.remove(file_id);
+                                drop(buf);
+
+                                // Create a file message with the reassembled data
+                                if let Some(mut h) = header {
+                                    h.payload = file_data;
+                                    conv.message_ids.push(h.id);
+                                    conv.unread += 1;
+                                    drop(conversations);
+                                    let _ = self.send_receipt(&assembled_sender, h.id, ReceiptType::Delivered).await;
+                                    self.inbox.write().await.push(h);
+                                } else {
+                                    // No header yet — create synthetic file message
+                                    let file_msg = CipherMessage {
+                                        id: msg_id,
+                                        sender: assembled_sender.clone(),
+                                        recipient: self.our_address(),
+                                        msg_type: MessageType::File(crate::message::FileMetadata {
+                                            file_name: format!("file_{}", &file_id[..8]),
+                                            mime_type: "application/octet-stream".to_string(),
+                                            size_bytes: file_data.len() as u64,
+                                            total_chunks: tc,
+                                            merkle_root: [0u8; 32],
+                                            thumbnail: None,
+                                        }),
+                                        timestamp: chrono::Utc::now(),
+                                        payload: file_data,
+                                        nonce: [0u8; 12],
+                                        dh_public: [0u8; 32],
+                                        counter: 0,
+                                        ttl: 0,
+                                    };
+                                    conv.message_ids.push(msg_id);
+                                    conv.unread += 1;
+                                    drop(conversations);
+                                    self.inbox.write().await.push(file_msg);
+                                }
+                            } else {
+                                drop(buf);
+                                drop(conversations);
+                            }
+                            continue;
+                        }
+                        MessageType::File(_) => {
+                            // File header — check if it has file_id in the payload (chunked transfer)
+                            if let Ok(payload_str) = String::from_utf8(msg.payload.clone()) {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                                    if let Some(fid) = json.get("file_id").and_then(|v| v.as_str()) {
+                                        // Chunked file — store header in chunk buffer
+                                        let mut buf = self.chunk_buffer.write().await;
+                                        let assembly = buf.entry(fid.to_string()).or_insert_with(|| ChunkAssembly {
+                                            sender: sender.clone(),
+                                            total_chunks: 0,
+                                            chunks: HashMap::new(),
+                                            header_msg: None,
+                                        });
+                                        assembly.header_msg = Some(msg.clone());
+                                        
+                                        // Check if all chunks already arrived before header
+                                        if assembly.total_chunks > 0 && assembly.chunks.len() == assembly.total_chunks as usize {
+                                            let mut file_data = Vec::new();
+                                            for i in 0..assembly.total_chunks {
+                                                if let Some(chunk) = assembly.chunks.get(&i) {
+                                                    file_data.extend_from_slice(chunk);
+                                                }
+                                            }
+                                            let mut h = msg.clone();
+                                            h.payload = file_data;
+                                            buf.remove(fid);
+                                            drop(buf);
+                                            
+                                            conv.message_ids.push(h.id);
+                                            conv.unread += 1;
+                                            drop(conversations);
+                                            let _ = self.send_receipt(&sender, h.id, ReceiptType::Delivered).await;
+                                            self.inbox.write().await.push(h);
+                                        } else {
+                                            drop(buf);
+                                            drop(conversations);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Non-chunked file (legacy single message) — fall through to normal handling
+                            conv.message_ids.push(msg_id);
+                            conv.unread += 1;
+                            drop(conversations);
+                            let _ = self.send_receipt(&sender, msg_id, ReceiptType::Delivered).await;
                         }
                         _ => {
                             // Normal message — track and add to inbox

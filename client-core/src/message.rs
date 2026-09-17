@@ -59,6 +59,15 @@ pub enum MessageType {
     CallMedia,
     /// Typing indicator
     Typing(bool),
+    /// File chunk (proper chunked transfer)
+    FileChunk {
+        /// ID linking chunks to their header
+        file_id: String,
+        /// Chunk index (0-based)
+        chunk_index: u32,
+        /// Total number of chunks
+        total_chunks: u32,
+    },
     /// Group management
     GroupAction(GroupAction),
     /// Online/offline presence broadcast
