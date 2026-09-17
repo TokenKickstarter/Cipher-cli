@@ -40,7 +40,7 @@ impl Default for DirectTransportConfig {
             relay_addrs: vec![RELAY_WS.to_string(), RELAY_TCP.to_string()],
             max_stored_messages: 1000,
             message_ttl: 30 * 86400, // 30 days
-            poll_interval_ms: 15000, // 15 seconds to minimize Cloudflare Worker request consumption (100k/daily limit)
+            poll_interval_ms: 3000, // 3 seconds — relay is lightweight, Cloudflare handles scaling
         }
     }
 }
@@ -175,142 +175,139 @@ impl DirectTransport {
         }
     }
 
-    /// Flush pending outbox messages to the relay.
+    /// Flush pending outbox messages to the relay via JSON REST API.
     pub async fn flush_outbox(&self, sender: &dyn RelaySender) {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
         let mut outbox = self.outbox.write().await;
-        // Take the pending map temporarily so we can await inside the loop
-        // without holding a borrow to the entire map contents.
         let pending = std::mem::take(&mut outbox.pending);
 
         for (recipient, messages) in pending {
             let mut failed_messages = Vec::new();
 
             for mut msg in messages {
-                let chunk = StoredChunk {
-                    // PRIVACY: sealed mailbox hash, not real address
-                    recipient_id: sealed_mailbox(&recipient),
-                    message_id: uuid::Uuid::new_v4().to_string(),
-                    ciphertext: msg.message.clone(),
-                    stored_at: chrono::Utc::now().timestamp() as u64,
-                    expires_at: (chrono::Utc::now().timestamp() as u64) + self.config.message_ttl,
-                };
+                let recipient_id = sealed_mailbox(&recipient);
+                let message_id = uuid::Uuid::new_v4().to_string();
+                let data_b64 = BASE64.encode(&msg.message);
 
-                let req = RelayRequest::Store(chunk);
-                match sender.send_to_relay(&req).await {
-                    Ok(response_bytes) => {
-                        if let Ok(resp) = bincode::deserialize::<RelayResponse>(&response_bytes) {
-                            match resp {
-                                RelayResponse::Stored { message_id } => {
-                                    debug!(
-                                        "[Transport] ✅ Stored message {} for {}",
-                                        message_id, recipient
-                                    );
-                                }
-                                RelayResponse::Error(e) => {
-                                    warn!("[Transport] Relay error storing message: {}", e);
-                                    msg.retry_count += 1;
-                                    failed_messages.push(msg);
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        } else {
-                            warn!("[Transport] Failed to decode relay response in outbox: {}", String::from_utf8_lossy(&response_bytes));
-                            msg.retry_count += 1;
-                            failed_messages.push(msg);
-                            continue;
-                        }
+                let payload = serde_json::json!({
+                    "recipient_id": recipient_id,
+                    "message_id": message_id,
+                    "data": data_b64,
+                    "ttl": self.config.message_ttl,
+                });
+
+                let url = format!("{}/store", self.relay_url);
+                let body = payload.to_string();
+
+                let result = tokio::task::spawn_blocking(move || {
+                    ureq::post(&url)
+                        .set("Content-Type", "application/json")
+                        .timeout(std::time::Duration::from_secs(30))
+                        .send_string(&body)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(_resp)) => {
+                        debug!("[Transport] ✅ Stored {} for {}", &message_id[..8], &recipient_id[..12]);
                         outbox.delivered_count += 1;
                     }
+                    Ok(Err(e)) => {
+                        debug!("[Transport] Store failed: {}", e);
+                        msg.retry_count += 1;
+                        failed_messages.push(msg);
+                    }
                     Err(e) => {
-                        debug!("[Transport] Failed to send to relay (will retry): {}", e);
+                        debug!("[Transport] Task error: {}", e);
                         msg.retry_count += 1;
                         failed_messages.push(msg);
                     }
                 }
             }
 
-            // Put back any messages that failed to deliver
             if !failed_messages.is_empty() {
                 outbox.pending.insert(recipient, failed_messages);
             }
         }
     }
 
-    /// Poll relay for messages addressed to us.
-    pub async fn poll_incoming(&self, sender: &dyn RelaySender) {
-        let req = RelayRequest::Fetch {
-            // PRIVACY: sealed mailbox hash
-            recipient_id: sealed_mailbox(&self.peer_id),
-        };
+    /// Poll relay for messages addressed to us via JSON REST API.
+    pub async fn poll_incoming(&self, _sender: &dyn RelaySender) {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-        match sender.send_to_relay(&req).await {
-            Ok(response_bytes) => {
-                if let Ok(resp) = bincode::deserialize::<RelayResponse>(&response_bytes) {
-                    match resp {
-                        RelayResponse::Chunks(chunks) if !chunks.is_empty() => {
-                            info!(
-                                "[Transport] 📬 Received {} messages from relay",
-                                chunks.len()
-                            );
-                            let mut message_ids = Vec::new();
+        let recipient_id = sealed_mailbox(&self.peer_id);
+        let fetch_url = format!("{}/fetch", self.relay_url);
+        let ack_url = format!("{}/ack", self.relay_url);
+        let rid = recipient_id.clone();
 
-                            for chunk in chunks {
-                                message_ids.push(chunk.message_id.clone());
-                                // Push to inbox
-                                let mut inbox = self.inbox.write().await;
-                                inbox.unread.push(chunk.ciphertext);
-                            }
+        let fetch_body = serde_json::json!({ "recipient_id": rid }).to_string();
 
-                            // Ack receipt so relay deletes them
-                            let ack_req = RelayRequest::Ack {
-                                recipient_id: sealed_mailbox(&self.peer_id),
-                                message_ids,
-                            };
-                            let _ = sender.send_to_relay(&ack_req).await;
-                            // Wake Dart instantly — push notification for HTTP-delivered messages
-                            crate::ffi::notify_dart();
+        let result = tokio::task::spawn_blocking(move || {
+            ureq::post(&fetch_url)
+                .set("Content-Type", "application/json")
+                .timeout(std::time::Duration::from_secs(10))
+                .send_string(&fetch_body)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(messages) = parsed["messages"].as_array() {
+                        if messages.is_empty() {
+                            return;
                         }
-                        _ => {} // No messages or error
+                        info!("[Transport] 📬 Received {} messages from relay", messages.len());
+                        let mut ack_ids: Vec<String> = Vec::new();
+
+                        for msg in messages {
+                            if let (Some(mid), Some(data_b64)) = (
+                                msg["message_id"].as_str(),
+                                msg["data"].as_str(),
+                            ) {
+                                ack_ids.push(mid.to_string());
+                                if let Ok(ciphertext) = BASE64.decode(data_b64) {
+                                    let mut inbox = self.inbox.write().await;
+                                    inbox.unread.push(ciphertext);
+                                }
+                            }
+                        }
+
+                        // Ack receipt
+                        if !ack_ids.is_empty() {
+                            let ack_body = serde_json::json!({
+                                "recipient_id": recipient_id,
+                                "message_ids": ack_ids,
+                            }).to_string();
+                            let ack_u = ack_url.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                ureq::post(&ack_u)
+                                    .set("Content-Type", "application/json")
+                                    .timeout(std::time::Duration::from_secs(5))
+                                    .send_string(&ack_body)
+                            }).await;
+                        }
+
+                        crate::ffi::notify_dart();
                     }
-                } else {
-                    debug!("[Transport] Failed to decode relay response in poll: {}", String::from_utf8_lossy(&response_bytes));
                 }
             }
+            Ok(Err(e)) => {
+                debug!("[Transport] Poll failed: {}", e);
+            }
             Err(e) => {
-                debug!("[Transport] Poll failed (relay may be down): {}", e);
+                debug!("[Transport] Poll task error: {}", e);
             }
         }
     }
 
-    /// Send a serialized request to the relay via HTTP POST (simple fallback).
-    /// In production, this would use a persistent libp2p WebSocket connection.
-    pub async fn fallback_send_to_relay(&self, request: &RelayRequest) -> Result<Vec<u8>, CipherError> {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-
-        let request_bytes = bincode::serialize(request)
-            .map_err(|e| CipherError::Network(format!("Serialize error: {}", e)))?;
-
-        let url = format!("{}/relay", self.relay_url);
-
-        // Use ureq for synchronous HTTP (works on all platforms)
-        let response = tokio::task::spawn_blocking(move || {
-            ureq::post(&url)
-                .set("Content-Type", "application/octet-stream")
-                .timeout(std::time::Duration::from_secs(30))
-                .send_bytes(&request_bytes)
-        })
-        .await
-        .map_err(|e| CipherError::Network(format!("Task join error: {}", e)))?
-        .map_err(|e| CipherError::Network(format!("HTTP error: {}", e)))?;
-
-        let mut body_bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut body_bytes)
-            .map_err(|e| CipherError::Network(format!("Read error: {}", e)))?;
-
-        Ok(body_bytes)
+    /// Send a request to the relay (legacy fallback — not used by new JSON API).
+    pub async fn fallback_send_to_relay(&self, _request: &RelayRequest) -> Result<Vec<u8>, CipherError> {
+        // The new JSON API uses flush_outbox and poll_incoming directly.
+        // This is kept for trait compatibility.
+        Ok(vec![])
     }
 
     /// Queue a message for delivery via the relay.
