@@ -207,12 +207,64 @@ pub async fn run() -> Result<(), String> {
                     println!();
                     println!("  {}", "Commands:".white().bold());
                     println!("  {} {}  {}", "@user".cyan(), "message".white(), "— Send a message".dimmed());
+                    println!("  {} {} {}", "/file".cyan(), "@user path".white(), "— Send a file".dimmed());
                     println!("  {} {}          {}", "/chat".cyan(), "@user".white(), "— Focus on one conversation".dimmed());
                     println!("  {} {}                {}", "/all".cyan(), "".white(), "— Show all conversations".dimmed());
                     println!("  {} {}           {}", "/contacts".cyan(), "".white(), "— List known contacts".dimmed());
                     println!("  {} {}              {}", "/clear".cyan(), "".white(), "— Clear screen".dimmed());
                     println!("  {} {}               {}", "/quit".cyan(), "".white(), "— Exit".dimmed());
                     println!();
+                }
+                "/file" | "/f" | "/send-file" => {
+                    // /file @user /path/to/file
+                    let file_parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                    if file_parts.len() < 2 || file_parts[0].is_empty() || file_parts[1].trim().is_empty() {
+                        // If focused, allow just /file /path/to/file
+                        let fp = focus_peer.read().await.clone();
+                        if let Some(ref peer_addr) = fp {
+                            if !arg.is_empty() {
+                                let file_path = arg.trim();
+                                match super::send_file::run_with_client(&client, peer_addr, file_path).await {
+                                    Ok(_) => {}
+                                    Err(e) => println!("  {} {}", "✗".red(), e),
+                                }
+                            } else {
+                                println!("  {} Usage: /file /path/to/file", "!".red());
+                            }
+                        } else {
+                            println!("  {} Usage: /file @username /path/to/file", "!".red());
+                        }
+                    } else {
+                        let target = file_parts[0];
+                        let file_path = file_parts[1].trim();
+
+                        let resolved = match super::resolve::resolve_recipient(target) {
+                            Ok(addr) => addr,
+                            Err(e) => {
+                                println!("  {} {}", "✗".red(), e);
+                                print!("  {} ", "▶".green().bold());
+                                let _ = io::stdout().flush();
+                                continue;
+                            }
+                        };
+
+                        match super::send_file::run_with_client(&client, &resolved, file_path).await {
+                            Ok(_) => {
+                                // Cache contact
+                                let display = if target.starts_with('@') || !target.starts_with("0x") {
+                                    target.trim_start_matches('@').to_string()
+                                } else {
+                                    if resolved.len() > 10 {
+                                        format!("{}...{}", &resolved[..6], &resolved[resolved.len()-4..])
+                                    } else {
+                                        resolved.clone()
+                                    }
+                                };
+                                contacts.write().await.insert(resolved.to_lowercase(), display);
+                            }
+                            Err(e) => println!("  {} {}", "✗".red(), e),
+                        }
+                    }
                 }
                 "/chat" | "/c" => {
                     if arg.is_empty() {

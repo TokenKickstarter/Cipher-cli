@@ -144,3 +144,43 @@ pub async fn run(recipient: &str, file_path: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+/// Send a file using an existing SwarmClient (used by interactive shell).
+pub async fn run_with_client(client: &Arc<SwarmClient>, recipient: &str, file_path: &str) -> Result<(), String> {
+    use colored::Colorize;
+
+    let path = std::path::Path::new(file_path);
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+
+    let file_name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    let mime_type = guess_mime(path);
+    let file_data = std::fs::read(path)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_size = file_data.len() as u64;
+
+    println!("  {} {} ({}, {})", "📎".yellow(), file_name.white().bold(), format_size(file_size).dimmed(), mime_type.dimmed());
+
+    let (msg_id, metadata) = client
+        .send_file(recipient, &file_data, file_name, mime_type)
+        .await
+        .map_err(|e| format!("File send failed: {e}"))?;
+
+    // Wait for relay flush
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+    let time = chrono::Utc::now().format("%H:%M:%S");
+    println!(
+        "  {} {} 📎 {} {} {}",
+        format!("[{}]", time).dimmed(),
+        "▶".green().bold(),
+        file_name.yellow(),
+        format!("({})", format_size(metadata.size_bytes)).dimmed(),
+        "✓".green(),
+    );
+
+    Ok(())
+}
