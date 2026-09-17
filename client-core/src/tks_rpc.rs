@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::CipherError;
 
 const DEBUG_FILE: &str =
-    "/tmp/cipher-sync-debug.txt";
+    "/Users/indigo/Downloads/mobile-app/ninjaswap-mobile-design/SYNC_DEBUG.txt";
 
 pub fn log_to_file(msg: &str) {
     if let Ok(mut file) = OpenOptions::new()
@@ -140,7 +140,7 @@ impl TksRpcClient {
             method,
             serde_json::to_string(&request.params).unwrap_or_default()
         );
-        println!("{}", log_msg);
+        log::debug!("{}", log_msg);
         log_to_file(&log_msg);
 
         // Add 10-second timeout to prevent hangs
@@ -160,7 +160,7 @@ impl TksRpcClient {
                         "[TKS RPC] Error (ID {}): code={}, message={}, data={:?}",
                         id, err.code, err.message, err.data
                     );
-                    println!("{}", err_msg);
+                    log::debug!("{}", err_msg);
                     log_to_file(&err_msg);
                     return Err(CipherError::Network(format!(
                         "TKS RPC error {}: {}",
@@ -168,11 +168,11 @@ impl TksRpcClient {
                     )));
                 }
 
-                println!("[TKS RPC] Response (ID {}): success", id);
+                log::debug!("[TKS RPC] Response (ID {}): success", id);
                 Ok(json_resp.result.unwrap_or(serde_json::Value::Null))
             }
             Err(e) => {
-                println!("[TKS RPC] HTTP Error (ID {}): {}", id, e);
+                log::debug!("[TKS RPC] HTTP Error (ID {}): {}", id, e);
                 Err(CipherError::Network(format!(
                     "HTTP error connecting to TKS node at {}: {}",
                     self.endpoint, e
@@ -295,7 +295,7 @@ impl TksRpcClient {
         ecdsa_secret: &k256::ecdsa::SigningKey,
     ) -> Result<String, CipherError> {
         log::info!("[TKS RPC] Registering @{} on-chain (FREE)", username);
-        println!("[TKS RPC] submit_name_register called for @{}", username);
+        log::debug!("[TKS RPC] submit_name_register called for @{}", username);
 
         // 1. Get chain info
         let genesis_hash = self.genesis_hash()?;

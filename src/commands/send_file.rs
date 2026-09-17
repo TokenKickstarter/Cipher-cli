@@ -149,9 +149,11 @@ pub async fn run(recipient: &str, file_path: &str) -> Result<(), String> {
 pub async fn run_with_client(client: &Arc<SwarmClient>, recipient: &str, file_path: &str) -> Result<(), String> {
     use colored::Colorize;
 
-    let path = std::path::Path::new(file_path);
+    // Strip surrounding quotes (users type '/path/to file.mp3' or "/path/to file.mp3")
+    let clean_path = file_path.trim_matches(|c| c == '\'' || c == '"');
+    let path = std::path::Path::new(clean_path);
     if !path.exists() {
-        return Err(format!("File not found: {}", file_path));
+        return Err(format!("File not found: {}", clean_path));
     }
 
     let file_name = path.file_name()
