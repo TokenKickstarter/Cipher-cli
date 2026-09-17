@@ -249,69 +249,52 @@ impl SwarmClient {
         file_name: &str,
         mime_type: &str,
     ) -> Result<(MessageId, crate::message::FileMetadata), CipherError> {
-        use crate::file_chunker;
-
         let session_key = self.derive_temp_session_key(recipient);
-
-        // Chunk and encrypt the file
-        let mut chunked = file_chunker::encrypt_and_chunk(file_data, &session_key, 30)?;
-        chunked.file_name = Some(file_name.to_string());
-        chunked.mime_type = Some(mime_type.to_string());
 
         let metadata = crate::message::FileMetadata {
             file_name: file_name.to_string(),
             mime_type: mime_type.to_string(),
             size_bytes: file_data.len() as u64,
-            total_chunks: chunked.chunks.len() as u32,
-            merkle_root: chunked.merkle_root,
+            total_chunks: 1,
+            merkle_root: {
+                use sha2::{Sha256, Digest};
+                let mut h = Sha256::new();
+                h.update(file_data);
+                let result = h.finalize();
+                let mut root = [0u8; 32];
+                root.copy_from_slice(&result);
+                root
+            },
             thumbnail: None,
         };
 
-        // 1. Send metadata header
-        let our_addr = self.our_address();
-        let header_payload = serde_json::to_vec(&metadata)
-            .map_err(|e| CipherError::File(format!("Metadata serialization failed: {e}")))?;
-        let encrypted_header = aes_encrypt(&session_key, &header_payload)?;
+        // Encrypt the ACTUAL file data (not just metadata)
+        let encrypted = aes_encrypt(&session_key, file_data)?;
 
-        let header_msg = CipherMessage {
+        let our_addr = self.our_address();
+        let msg = CipherMessage {
             id: uuid::Uuid::new_v4(),
             sender: our_addr.clone(),
             recipient: recipient.to_string(),
             msg_type: MessageType::File(metadata.clone()),
             timestamp: chrono::Utc::now(),
-            payload: encrypted_header.ciphertext,
-            nonce: encrypted_header.nonce,
+            payload: encrypted.ciphertext,
+            nonce: encrypted.nonce,
             dh_public: [0u8; 32],
             counter: 0,
             ttl: 30 * 86400,
         };
 
-        let header_id = header_msg.id;
-        let data = header_msg.to_bytes();
+        let msg_id = msg.id;
+        let data = msg.to_bytes();
+
+        // Send via transport and flush immediately
         self.transport.queue_message(recipient, data).await?;
-        self.sent_log.write().await.insert(header_id, header_msg);
+        self.transport.direct.flush_outbox(&crate::transport::direct::DefaultSender {
+            direct: self.transport.direct.clone(),
+        }).await;
 
-        // 2. Send each chunk as a separate message
-        for chunk in &chunked.chunks {
-            let chunk_bytes = serde_json::to_vec(chunk)
-                .map_err(|e| CipherError::File(format!("Chunk serialization failed: {e}")))?;
-
-            let chunk_msg = CipherMessage {
-                id: uuid::Uuid::new_v4(),
-                sender: our_addr.clone(),
-                recipient: recipient.to_string(),
-                msg_type: MessageType::Text, // Chunks are opaque blobs
-                timestamp: chrono::Utc::now(),
-                payload: chunk_bytes,
-                nonce: [0u8; 12],
-                dh_public: [0u8; 32],
-                counter: chunk.chunk_index as u64,
-                ttl: 30 * 86400,
-            };
-
-            let data = chunk_msg.to_bytes();
-            self.transport.queue_message(recipient, data).await?;
-        }
+        self.sent_log.write().await.insert(msg_id, msg);
 
         // Track in conversation
         let mut conversations = self.conversations.write().await;
@@ -322,18 +305,17 @@ impl SwarmClient {
             statuses: HashMap::new(),
             unread: 0,
         });
-        conv.message_ids.push(header_id);
-        conv.statuses.insert(header_id, DeliveryStatus::Queued);
+        conv.message_ids.push(msg_id);
+        conv.statuses.insert(msg_id, DeliveryStatus::Queued);
 
         info!(
-            "File '{}' ({} bytes, {} chunks) queued for {}",
+            "File '{}' ({} bytes) sent to {}",
             file_name,
             file_data.len(),
-            chunked.chunks.len(),
             recipient
         );
 
-        Ok((header_id, metadata))
+        Ok((msg_id, metadata))
     }
 
     pub async fn send_webrtc_media(&self, recipient: &str, media_bytes: Vec<u8>) -> Result<MessageId, CipherError> {
