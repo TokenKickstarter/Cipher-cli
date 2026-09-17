@@ -71,14 +71,53 @@ fn print_message(msg: &client_core::message::CipherMessage) {
             println!("  {}", text.white());
         }
         MessageType::File(meta) => {
-            println!();
-            println!(
-                "  {} {} {} 📎 {}",
-                format!("[{}]", time).dimmed(),
-                sender_short.cyan().bold(),
-                "→".dimmed(),
-                format!("{} ({} bytes)", meta.file_name, meta.size_bytes).yellow(),
-            );
+            // Save file to ~/Downloads/cipher-files/
+            let download_dir = dirs::download_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("cipher-files");
+            std::fs::create_dir_all(&download_dir).ok();
+
+            let safe_name = meta.file_name.replace('/', "_").replace('\\', "_");
+            let dest = download_dir.join(&safe_name);
+
+            // Avoid overwriting — add suffix if exists
+            let dest = if dest.exists() {
+                let stem = dest.file_stem().unwrap_or_default().to_string_lossy().to_string();
+                let ext = dest.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+                let ts = chrono::Utc::now().format("%H%M%S");
+                download_dir.join(format!("{}-{}{}", stem, ts, ext))
+            } else {
+                dest
+            };
+
+            match std::fs::write(&dest, &msg.payload) {
+                Ok(_) => {
+                    println!();
+                    println!(
+                        "  {} {} {} 📎 {}",
+                        format!("[{}]", time).dimmed(),
+                        sender_short.cyan().bold(),
+                        "→".dimmed(),
+                        format!("{} ({} bytes)", meta.file_name, meta.size_bytes).yellow(),
+                    );
+                    println!(
+                        "  {} {}",
+                        "💾 Saved:".green(),
+                        dest.display().to_string().white().bold(),
+                    );
+                }
+                Err(e) => {
+                    println!();
+                    println!(
+                        "  {} {} {} 📎 {} (save failed: {})",
+                        format!("[{}]", time).dimmed(),
+                        sender_short.cyan().bold(),
+                        "→".dimmed(),
+                        format!("{} ({} bytes)", meta.file_name, meta.size_bytes).yellow(),
+                        e,
+                    );
+                }
+            }
         }
         MessageType::CallSignal(_) => {
             println!(
