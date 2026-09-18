@@ -96,9 +96,9 @@ pub async fn run() -> Result<(), String> {
                 match &msg.msg_type {
                     MessageType::Text => {
                         let text = String::from_utf8_lossy(&msg.payload);
-                        print!("\x1b[2K\r"); // Clear entire line
+                        println!(); // New line — preserves what user is typing
                         println!(
-                            "\r  {} {} {} {}",
+                            "  {} {} {} {}",
                             format!("[{}]", time).dimmed(),
                             display_name.cyan().bold(),
                             "◀".cyan(),
@@ -128,9 +128,9 @@ pub async fn run() -> Result<(), String> {
                         let dest = download_dir.join(&safe_name);
                         let _ = std::fs::write(&dest, &msg.payload);
 
-                        print!("\x1b[2K\r");
+                        println!();
                         println!(
-                            "\r  {} {} {} 📎 {} ({})",
+                            "  {} {} {} 📎 {} ({})",
                             format!("[{}]", time).dimmed(),
                             display_name.cyan().bold(),
                             "◀".cyan(),
