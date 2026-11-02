@@ -90,6 +90,9 @@ libp2p = { version = "0.54", features = [
   "request-response", "identify", "dns", "macros", "serde"
 ] }
 
+# Iroh P2P QUIC + Magicsock hole-punching
+iroh = { version = "1.4", default-features = false, features = ["tls-ring", "portmapper"] }
+
 # Logging
 log = "0.4"
 env_logger = "0.11"

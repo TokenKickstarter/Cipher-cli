@@ -85,7 +85,8 @@ impl SwarmClient {
     pub fn new(identity: CipherIdentity) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(1000);
         let peer_id = identity.display_address();
-        let transport = TransportRouter::new(peer_id);
+        let secret_bytes = identity.ed25519_secret_bytes();
+        let transport = TransportRouter::new_with_secret(peer_id, secret_bytes);
 
         Self {
             identity,
@@ -168,9 +169,8 @@ impl SwarmClient {
     pub fn with_config(identity: CipherIdentity, config: DirectTransportConfig) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(1000);
         let peer_id = identity.display_address();
-        // Since TransportRouter manages Tor/Nym too, we inject the config into the direct transport
-        // For now, we just use the default router initialization
-        let transport = TransportRouter::new(peer_id);
+        let secret_bytes = identity.ed25519_secret_bytes();
+        let transport = TransportRouter::new_with_secret(peer_id, secret_bytes);
 
         Self {
             identity,

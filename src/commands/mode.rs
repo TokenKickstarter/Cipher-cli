@@ -50,7 +50,7 @@ pub async fn run(mode_arg: Option<&str>) -> Result<(), String> {
     if let Some(new_mode) = mode_arg {
         let normalized = new_mode.to_lowercase().trim().to_string();
         match normalized.as_str() {
-            "direct" | "tor" | "nym" | "front" | "domain-fronting" | "auto" => {
+            "direct" | "iroh" | "tor" | "nym" | "front" | "domain-fronting" | "auto" => {
                 config.transport_mode = match normalized.as_str() {
                     "front" => "domain-fronting".to_string(),
                     other => other.to_string(),
@@ -61,7 +61,7 @@ pub async fn run(mode_arg: Option<&str>) -> Result<(), String> {
                 println!();
             }
             _ => {
-                return Err("Invalid mode. Choose: direct, tor, nym, front, or auto".to_string());
+                return Err("Invalid mode. Choose: direct, iroh, tor, nym, front, or auto".to_string());
             }
         }
     } else {
@@ -72,11 +72,12 @@ pub async fn run(mode_arg: Option<&str>) -> Result<(), String> {
         println!("  {} {}", "Current Mode:".dimmed(), config.transport_mode.cyan().bold());
         println!();
         println!("  {}", "Available Privacy Modes:".white().bold());
-        println!("    {} {} — Fast, direct connection to Storage Swarm (default)", "• direct".white().bold(), "".dimmed());
-        println!("    {}    — Routes traffic through 3-hop onion circuit (IP hidden)", "• tor   ".white().bold());
-        println!("    {}    — 5-hop decentralized mixnet with cover traffic (Metadata immune)", "• nym   ".white().bold());
-        println!("    {}  — Circumvents firewalls via Cloudflare Workers", "• front ".white().bold());
-        println!("    {}   — Automatically selects Nym → Tor → Direct fallback", "• auto  ".white().bold());
+        println!("    {}    — Direct QUIC + Magicsock P2P (UDP hole punching, zero relay)", "• iroh  ".white().bold());
+        println!("    {}  — Fast, direct connection to Storage Swarm (default)", "• direct".white().bold());
+        println!("    {}     — Routes traffic through 3-hop onion circuit (IP hidden)", "• tor   ".white().bold());
+        println!("    {}     — 5-hop decentralized mixnet with cover traffic (Metadata immune)", "• nym   ".white().bold());
+        println!("    {}   — Circumvents firewalls via Cloudflare Workers", "• front ".white().bold());
+        println!("    {}    — Automatically selects Iroh P2P → Nym → Tor → Direct fallback", "• auto  ".white().bold());
         println!();
         println!("  {} Run `cipher-cli mode <mode>` or `/mode <mode>` to switch", "💡".yellow());
         println!();

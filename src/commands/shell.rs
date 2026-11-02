@@ -250,7 +250,7 @@ pub async fn run() -> Result<(), String> {
                     println!();
                     println!("  {}", "─── 🛡️  Privacy & Network ────────────────────────".dimmed());
                     println!("  {} {}        {}", "/status".cyan(), "".white(), "— Check relay & P2P connectivity".dimmed());
-                    println!("  {} {}   {}", "/mode".cyan(), "[direct|tor|nym]".white(), "— View or toggle privacy mode".dimmed());
+                    println!("  {} {}   {}", "/mode".cyan(), "[iroh|direct|tor|nym]".white(), "— View or toggle privacy mode".dimmed());
                     println!("  {} {}          {}", "/quit".cyan(), "".white(), "— Exit chat".dimmed());
                     println!();
                 }

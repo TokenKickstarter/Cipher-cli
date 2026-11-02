@@ -280,10 +280,11 @@ pub extern "C" fn cipher_set_transport_mode(mode: *const c_char) -> *mut c_char 
     
     let transport_mode = match mode_str.as_str() {
         "auto" => crate::transport::TransportMode::Auto,
+        "iroh" => crate::transport::TransportMode::Iroh,
         "direct" => crate::transport::TransportMode::Direct,
         "tor" => crate::transport::TransportMode::Tor,
         "nym" => crate::transport::TransportMode::Nym,
-        _ => return json_err("Invalid mode. Use: auto, direct, tor, nym"),
+        _ => return json_err("Invalid mode. Use: auto, iroh, direct, tor, nym"),
     };
 
     runtime().block_on(async {
@@ -326,6 +327,7 @@ pub extern "C" fn cipher_get_transport_mode() -> *mut c_char {
         
         let mode_str = match current_mode {
             crate::transport::TransportMode::Auto => "auto",
+            crate::transport::TransportMode::Iroh => "iroh",
             crate::transport::TransportMode::Direct => "direct",
             crate::transport::TransportMode::Tor => "tor",
             crate::transport::TransportMode::Nym => "nym",

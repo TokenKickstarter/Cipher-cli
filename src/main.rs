@@ -138,9 +138,9 @@ enum Commands {
         amount: String,
     },
 
-    /// View or set privacy transport mode (direct, tor, nym, front, auto)
+    /// View or set privacy transport mode (iroh, direct, tor, nym, front, auto)
     Mode {
-        /// Transport mode: direct, tor, nym, front, or auto
+        /// Transport mode: iroh, direct, tor, nym, front, or auto
         mode: Option<String>,
     },
 

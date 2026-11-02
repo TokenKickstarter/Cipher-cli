@@ -171,6 +171,11 @@ impl CipherIdentity {
         self.ed25519_signing.verifying_key()
     }
 
+    /// Get the Ed25519 signing key secret bytes (32 bytes).
+    pub fn ed25519_secret_bytes(&self) -> [u8; 32] {
+        self.ed25519_signing.to_bytes()
+    }
+
     /// Get the X25519 public key for key exchange.
     pub fn x25519_public_key(&self) -> X25519PublicKey {
         X25519PublicKey::from(&self.x25519_secret)
