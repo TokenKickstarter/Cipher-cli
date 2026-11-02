@@ -724,7 +724,7 @@ mod tests {
     async fn test_node_statuses() {
         let reg = UsernameRegistry::new("0xAlice".into(), RegistryBackend::TksNode);
         let statuses = reg.node_statuses().await;
-        assert_eq!(statuses.len(), 4); // 4 TKS node endpoints (1 local + 3 remote)
+        assert_eq!(statuses.len(), TKS_NODES.len());
         assert!(statuses.iter().all(|s| s.connected));
     }
 

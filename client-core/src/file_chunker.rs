@@ -1,6 +1,7 @@
 //! # File Chunker Module
 //!
-//! Splits files into 2MB encrypted chunks with Merkle tree verification.
+//! Splits files into **512 KiB** encrypted chunks (HyperSwarm-safe; see
+//! `tks-substrate-node/network/CIPHER-CLIENT-CHUNKING-SPEC.md`).
 //! Files NEVER touch the blockchain — stored temporarily on swarm nodes.
 
 use aes_gcm::{
@@ -11,8 +12,92 @@ use sha2::{Digest, Sha256};
 
 use crate::error::CipherError;
 
-/// Default chunk size: 2 MB
-pub const CHUNK_SIZE: usize = 2 * 1024 * 1024;
+/// Plaintext bytes per piece (before AES-GCM). See CIPHER-CLIENT-CHUNKING-SPEC.md.
+pub const CHUNK_SIZE: usize = 512 * 1024;
+
+/// Relay + libp2p JSON request-response limit (~1 MiB); reject larger wire blobs.
+pub const MAX_RELAY_CIPHERTEXT: usize = 900_000;
+
+/// Wire format version inside relay `EncryptedChunk.ciphertext`.
+pub const RELAY_WIRE_VERSION: u8 = 1;
+
+/// Bincode payload stored in relay `EncryptedChunk.ciphertext` (spec v1).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayWireChunk {
+    pub version: u8,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub nonce: [u8; 12],
+    pub chunk_hash: [u8; 32],
+    pub merkle_root: [u8; 32],
+    pub aes_ciphertext: Vec<u8>,
+}
+
+/// Relay `message_id` for a file piece: `{file_id}#c{index:05}`.
+pub fn relay_message_id(file_id: &str, chunk_index: u32) -> String {
+    format!("{file_id}#c{chunk_index:05}")
+}
+
+/// Relay `message_id` for encrypted `FileMetadata` header.
+pub fn relay_header_message_id(file_id: &str) -> String {
+    format!("{file_id}#header")
+}
+
+/// Parse piece id; returns `(file_id, chunk_index)` or None for `#header`.
+pub fn parse_relay_message_id(message_id: &str) -> Option<(String, Option<u32>)> {
+    if message_id.ends_with("#header") {
+        return Some((message_id.trim_end_matches("#header").to_string(), None));
+    }
+    let (file_id, idx) = message_id.rsplit_once("#c")?;
+    let index: u32 = idx.parse().ok()?;
+    Some((file_id.to_string(), Some(index)))
+}
+
+impl EncryptedChunk {
+    /// Encode for `POST /store` → field `ciphertext`.
+    pub fn to_relay_wire_bytes(&self) -> Result<Vec<u8>, CipherError> {
+        let wire = RelayWireChunk {
+            version: RELAY_WIRE_VERSION,
+            chunk_index: self.chunk_index,
+            total_chunks: self.total_chunks,
+            nonce: self.nonce,
+            chunk_hash: self.chunk_hash,
+            merkle_root: self.merkle_root,
+            aes_ciphertext: self.ciphertext.clone(),
+        };
+        let bytes = bincode::serialize(&wire)
+            .map_err(|e| CipherError::File(format!("wire encode: {e}")))?;
+        if bytes.len() > MAX_RELAY_CIPHERTEXT {
+            return Err(CipherError::File(format!(
+                "relay wire {} bytes exceeds MAX_RELAY_CIPHERTEXT {}",
+                bytes.len(),
+                MAX_RELAY_CIPHERTEXT
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Decode relay `EncryptedChunk.ciphertext` bytes.
+    pub fn from_relay_wire_bytes(data: &[u8]) -> Result<Self, CipherError> {
+        let wire: RelayWireChunk = bincode::deserialize(data)
+            .map_err(|e| CipherError::File(format!("wire decode: {e}")))?;
+        if wire.version != RELAY_WIRE_VERSION {
+            return Err(CipherError::File(format!(
+                "unsupported relay wire version {}",
+                wire.version
+            )));
+        }
+        Ok(EncryptedChunk {
+            chunk_index: wire.chunk_index,
+            total_chunks: wire.total_chunks,
+            ciphertext: wire.aes_ciphertext,
+            nonce: wire.nonce,
+            chunk_hash: wire.chunk_hash,
+            merkle_root: wire.merkle_root,
+            expires_at: 0,
+        })
+    }
+}
 
 /// An encrypted chunk of a file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -50,7 +135,7 @@ pub struct ChunkedFile {
 
 /// Encrypt and chunk a file for transmission.
 ///
-/// - Splits into 2MB chunks
+/// - Splits into 512 KiB plaintext chunks
 /// - AES-256-GCM encrypts each chunk
 /// - Computes Merkle root for integrity
 pub fn encrypt_and_chunk(
@@ -86,7 +171,7 @@ pub fn encrypt_and_chunk(
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&nonce_bytes);
 
-        chunks.push(EncryptedChunk {
+        let piece = EncryptedChunk {
             chunk_index: i as u32,
             total_chunks: total_chunks as u32,
             ciphertext,
@@ -94,7 +179,9 @@ pub fn encrypt_and_chunk(
             chunk_hash,
             merkle_root: [0u8; 32], // Filled in second pass
             expires_at,
-        });
+        };
+        piece.to_relay_wire_bytes()?;
+        chunks.push(piece);
     }
 
     // Compute Merkle root
@@ -225,11 +312,11 @@ mod tests {
     #[test]
     fn test_chunk_and_reassemble_multi_chunk() {
         let key = [42u8; 32];
-        // Create 5MB of data (3 chunks)
+        // 5 MiB → ceil(5M / 512K) = 10 chunks
         let data: Vec<u8> = (0..5_000_000).map(|i| (i % 256) as u8).collect();
 
         let chunked = encrypt_and_chunk(&data, &key, 30).unwrap();
-        assert_eq!(chunked.chunks.len(), 3); // ceil(5M / 2M) = 3
+        assert_eq!(chunked.chunks.len(), 10);
 
         let mut chunks = chunked.chunks;
         let reassembled = decrypt_and_reassemble(&mut chunks, &key).unwrap();
@@ -249,6 +336,26 @@ mod tests {
 
         let result = decrypt_and_reassemble(&mut chunks, &key);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_relay_message_id_parse() {
+        let id = relay_message_id("550e8400-e29b-41d4-a716-446655440000", 3);
+        assert_eq!(id, "550e8400-e29b-41d4-a716-446655440000#c00003");
+        let (fid, idx) = parse_relay_message_id(&id).unwrap();
+        assert_eq!(fid, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(idx, Some(3));
+    }
+
+    #[test]
+    fn test_relay_wire_roundtrip() {
+        let key = [1u8; 32];
+        let data = vec![0u8; 600_000];
+        let chunked = encrypt_and_chunk(&data, &key, 7).unwrap();
+        let wire = chunked.chunks[0].to_relay_wire_bytes().unwrap();
+        assert!(wire.len() <= MAX_RELAY_CIPHERTEXT);
+        let back = EncryptedChunk::from_relay_wire_bytes(&wire).unwrap();
+        assert_eq!(back.chunk_index, chunked.chunks[0].chunk_index);
     }
 
     #[test]

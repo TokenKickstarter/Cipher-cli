@@ -875,17 +875,21 @@ mod tests {
     async fn test_receive_messages() {
         let identity = CipherIdentity::generate().unwrap();
         let client = SwarmClient::new(identity);
+        let session_key = client.derive_temp_session_key("0xSender999");
+        use crate::encryption::aes_encrypt;
+        let enc = aes_encrypt(&session_key, b"test message").unwrap();
 
         // Simulate incoming message
         let msg = CipherMessage::new_text(
             "0xSender999",
             &client.our_address(),
-            vec![1, 2, 3],
-            [0u8; 12],
+            enc.ciphertext,
+            enc.nonce,
             [0u8; 32],
             0,
         );
-        client.transport.push_received(msg.to_bytes()).await;
+        client.transport.direct.push_received(msg.to_bytes()).await;
+        client.process_incoming().await;
 
         // Receive
         let received = client.receive_all().await;
