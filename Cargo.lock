@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "cipher-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "blake2",
@@ -504,6 +504,7 @@ dependencies = [
  "env_logger",
  "hex",
  "indicatif",
+ "k256",
  "log",
  "once_cell",
  "rand 0.8.8",
@@ -511,6 +512,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sha3",
  "tokio",
  "twox-hash",
  "ureq",
@@ -558,7 +560,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

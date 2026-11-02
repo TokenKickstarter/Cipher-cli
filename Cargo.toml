@@ -1,6 +1,6 @@
 [package]
 name = "cipher-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "Cipher CLI — Send & receive E2EE messages from the terminal"
 
@@ -40,6 +40,8 @@ sha2 = "0.10"
 
 # Hex encoding
 hex = "0.4"
+sha3 = "0.10"
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
 
 # Random
 rand = "0.8"

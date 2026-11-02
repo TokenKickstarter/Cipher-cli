@@ -14,3 +14,7 @@ pub mod balance;
 pub mod node_info;
 pub mod resolve;
 pub mod shell;
+pub mod transfer;
+pub mod mode;
+pub mod groups;
+pub mod channels;

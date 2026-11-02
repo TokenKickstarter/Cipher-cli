@@ -191,12 +191,25 @@ pub async fn run() -> Result<(), String> {
             continue;
         }
 
-        // ── Commands ─────────────────────────────────
-        if trimmed.starts_with('/') {
+        // ── Commands (with '/' or typed directly) ────
+        let is_slash_cmd = trimmed.starts_with('/');
+        let (cmd, arg) = if is_slash_cmd {
             let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
-            let cmd = parts[0].to_lowercase();
-            let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            (parts[0].to_lowercase(), parts.get(1).map(|s| s.trim()).unwrap_or(""))
+        } else {
+            let parts: Vec<&str> = trimmed.splitn(2, ' ').collect();
+            let first = parts[0].to_lowercase();
+            match first.as_str() {
+                "help" | "quit" | "exit" | "q" | "register" | "lookup" | "whoami" | "id" | "me" |
+                "balance" | "bal" | "transfer" | "send-tks" | "pay" | "status" | "node-info" | "info" |
+                "mode" | "group" | "groups" | "channel" | "channels" | "contacts" | "clear" | "all" => {
+                    (format!("/{}", first), parts.get(1).map(|s| s.trim()).unwrap_or(""))
+                }
+                _ => ("".to_string(), "")
+            }
+        };
 
+        if !cmd.is_empty() {
             match cmd.as_str() {
                 "/quit" | "/exit" | "/q" => {
                     println!();
@@ -205,15 +218,120 @@ pub async fn run() -> Result<(), String> {
                 }
                 "/help" | "/h" => {
                     println!();
-                    println!("  {}", "Commands:".white().bold());
-                    println!("  {} {}  {}", "@user".cyan(), "message".white(), "— Send a message".dimmed());
-                    println!("  {} {} {}", "/file".cyan(), "@user path".white(), "— Send a file".dimmed());
-                    println!("  {} {}          {}", "/chat".cyan(), "@user".white(), "— Focus on one conversation".dimmed());
-                    println!("  {} {}                {}", "/all".cyan(), "".white(), "— Show all conversations".dimmed());
-                    println!("  {} {}           {}", "/contacts".cyan(), "".white(), "— List known contacts".dimmed());
-                    println!("  {} {}              {}", "/clear".cyan(), "".white(), "— Clear screen".dimmed());
-                    println!("  {} {}               {}", "/quit".cyan(), "".white(), "— Exit".dimmed());
+                    println!("  {}", "⚔️  CIPHER CLI COMMANDS ⚔️".cyan().bold());
                     println!();
+                    println!("  {}", "─── 💬 Messaging ────────────────────────────────".dimmed());
+                    println!("  {} {}   {}", "@user".cyan(), "<msg>".white(), "— Send an encrypted message".dimmed());
+                    println!("  {} {}  {}", "/chat".cyan(), "<@user>".white(), "— Focus on one conversation".dimmed());
+                    println!("  {} {}   {}", "/all".cyan(), "".white(), "— Show all conversations (unfocus)".dimmed());
+                    println!("  {} {}  {}", "/file".cyan(), "<@user> <path>".white(), "— Send an encrypted file".dimmed());
+                    println!("  {} {}      {}", "/contacts".cyan(), "".white(), "— List known contacts".dimmed());
+                    println!("  {} {}         {}", "/clear".cyan(), "".white(), "— Clear screen".dimmed());
+                    println!();
+                    println!("  {}", "─── 👥 Groups & Channels ────────────────────────".dimmed());
+                    println!("  {} {}   {}", "/group".cyan(), "create <name>".white(), "— Create multi-user group".dimmed());
+                    println!("  {} {}     {}", "/group".cyan(), "list".white(), "— List your groups".dimmed());
+                    println!("  {} {}     {}", "/group".cyan(), "info <id>".white(), "— View group members".dimmed());
+                    println!("  {} {}  {}", "/group".cyan(), "add <id> <@user>".white(), "— Add member to group".dimmed());
+                    println!("  {} {}  {}", "/group".cyan(), "send <id> <msg>".white(), "— Broadcast to group".dimmed());
+                    println!("  {} {}    {}", "/group".cyan(), "leave <id>".white(), "— Leave group".dimmed());
+                    println!("  {} {} {}", "/channel".cyan(), "create <name> [handle]".white(), "— Create broadcast channel".dimmed());
+                    println!("  {} {}   {}", "/channel".cyan(), "list".white(), "— List broadcast channels".dimmed());
+                    println!("  {} {}   {}", "/channel".cyan(), "post <id> <msg>".white(), "— Publish broadcast post".dimmed());
+                    println!("  {} {}    {}", "/channel".cyan(), "sub <id>".white(), "— Subscribe to channel".dimmed());
+                    println!();
+                    println!("  {}", "─── ⛓️  TKS Blockchain & Wallet ─────────────────".dimmed());
+                    println!("  {} {}  {}", "/register".cyan(), "<@username>".white(), "— Register handle on TKS (FREE)".dimmed());
+                    println!("  {} {}    {}", "/lookup".cyan(), "<@user|0xaddr>".white(), "— Query on-chain identity".dimmed());
+                    println!("  {} {}        {}", "/whoami".cyan(), "".white(), "— Show your address & keys".dimmed());
+                    println!("  {} {}    {}", "/balance".cyan(), "[0xaddr]".white(), "— Check TKS token balance".dimmed());
+                    println!("  {} {}  {}", "/transfer".cyan(), "<@user> <amt>".white(), "— Send TKS native coins".dimmed());
+                    println!("  {} {}     {}", "/node-info".cyan(), "".white(), "— Blockchain height & status".dimmed());
+                    println!();
+                    println!("  {}", "─── 🛡️  Privacy & Network ────────────────────────".dimmed());
+                    println!("  {} {}        {}", "/status".cyan(), "".white(), "— Check relay & P2P connectivity".dimmed());
+                    println!("  {} {}   {}", "/mode".cyan(), "[direct|tor|nym]".white(), "— View or toggle privacy mode".dimmed());
+                    println!("  {} {}          {}", "/quit".cyan(), "".white(), "— Exit chat".dimmed());
+                    println!();
+                }
+                "/register" | "/reg" => {
+                    if arg.is_empty() {
+                        println!("  {} Usage: /register @username", "!".red());
+                    } else {
+                        if let Err(e) = super::register::run(arg).await {
+                            println!("  {} {}", "✗".red(), e);
+                        }
+                    }
+                }
+                "/lookup" | "/l" => {
+                    if arg.is_empty() {
+                        println!("  {} Usage: /lookup @username or 0xAddress", "!".red());
+                    } else {
+                        if let Err(e) = super::lookup::run(arg).await {
+                            println!("  {} {}", "✗".red(), e);
+                        }
+                    }
+                }
+                "/whoami" | "/id" | "/me" => {
+                    if let Err(e) = super::whoami::run().await {
+                        println!("  {} {}", "✗".red(), e);
+                    }
+                }
+                "/balance" | "/bal" => {
+                    let addr_opt = if arg.is_empty() { None } else { Some(arg) };
+                    if let Err(e) = super::balance::run(addr_opt).await {
+                        println!("  {} {}", "✗".red(), e);
+                    }
+                }
+                "/transfer" | "/send-tks" | "/pay" => {
+                    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+                    if parts.len() < 2 || parts[0].is_empty() || parts[1].trim().is_empty() {
+                        println!("  {} Usage: /transfer <@user|0xaddr> <amount>", "!".red());
+                    } else {
+                        if let Err(e) = super::transfer::run(parts[0], parts[1].trim()).await {
+                            println!("  {} {}", "✗".red(), e);
+                        }
+                    }
+                }
+                "/status" => {
+                    if let Err(e) = super::status::run().await {
+                        println!("  {} {}", "✗".red(), e);
+                    }
+                }
+                "/node-info" | "/info" => {
+                    if let Err(e) = super::node_info::run().await {
+                        println!("  {} {}", "✗".red(), e);
+                    }
+                }
+                "/mode" => {
+                    let mode_opt = if arg.is_empty() { None } else { Some(arg) };
+                    if let Err(e) = super::mode::run(mode_opt).await {
+                        println!("  {} {}", "✗".red(), e);
+                    }
+                }
+                "/group" | "/groups" | "/g" => {
+                    let parts: Vec<String> = arg.split_whitespace().map(|s| s.to_string()).collect();
+                    if parts.is_empty() {
+                        let _ = super::groups::run("help", &[]).await;
+                    } else {
+                        let action = &parts[0];
+                        let rest = &parts[1..];
+                        if let Err(e) = super::groups::run(action, rest).await {
+                            println!("  {} {}", "✗".red(), e);
+                        }
+                    }
+                }
+                "/channel" | "/channels" | "/ch" => {
+                    let parts: Vec<String> = arg.split_whitespace().map(|s| s.to_string()).collect();
+                    if parts.is_empty() {
+                        let _ = super::channels::run("help", &[]).await;
+                    } else {
+                        let action = &parts[0];
+                        let rest = &parts[1..];
+                        if let Err(e) = super::channels::run(action, rest).await {
+                            println!("  {} {}", "✗".red(), e);
+                        }
+                    }
                 }
                 "/file" | "/f" | "/send-file" => {
                     // /file @user /path/to/file

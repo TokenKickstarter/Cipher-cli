@@ -126,6 +126,45 @@ enum Commands {
 
     /// Query TKS blockchain node info (block height, runtime, pallets)
     NodeInfo,
+
+    /// Send TKS native coins to an address or @username
+    Transfer {
+        /// Recipient EVM address (0x...) or @username
+        #[arg(required = true)]
+        recipient: String,
+
+        /// Amount in TKS (e.g. 1.5)
+        #[arg(required = true)]
+        amount: String,
+    },
+
+    /// View or set privacy transport mode (direct, tor, nym, front, auto)
+    Mode {
+        /// Transport mode: direct, tor, nym, front, or auto
+        mode: Option<String>,
+    },
+
+    /// Multi-user group management and messaging
+    Group {
+        /// Action: create, list, add, info, send, leave
+        #[arg(required = true)]
+        action: String,
+
+        /// Arguments for the action
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Broadcast channels management and posting
+    Channel {
+        /// Action: create, list, post, sub, unsub
+        #[arg(required = true)]
+        action: String,
+
+        /// Arguments for the action
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn print_banner() {
@@ -222,6 +261,18 @@ async fn main() {
         }
         Some(Commands::NodeInfo) => {
             commands::node_info::run().await
+        }
+        Some(Commands::Transfer { recipient, amount }) => {
+            commands::transfer::run(&recipient, &amount).await
+        }
+        Some(Commands::Mode { mode }) => {
+            commands::mode::run(mode.as_deref()).await
+        }
+        Some(Commands::Group { action, args }) => {
+            commands::groups::run(&action, &args).await
+        }
+        Some(Commands::Channel { action, args }) => {
+            commands::channels::run(&action, &args).await
         }
     };
 

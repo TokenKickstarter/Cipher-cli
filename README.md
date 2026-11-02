@@ -8,9 +8,13 @@ Send & receive E2EE messages, register usernames on-chain, transfer files — al
 
 - 🔐 **AES-256-GCM** end-to-end encryption (Double Ratchet)
 - ⛓️ **TKS Blockchain** username registry (`@username` → address)
-- 📎 **File transfer** — images, video, documents (2MB encrypted chunks + Merkle tree)
-- 💬 **Interactive chat** mode (bidirectional real-time)
-- 🌐 **Decentralized relay** at `wss://signal.tokenkickstarter.com`
+- 💸 **Native TKS Transfers** — Send TKS coins to addresses or `@usernames` directly
+- 👥 **Multi-User Groups** — Create private groups, manage members, and chat
+- 📢 **Broadcast Channels** — Public announcements and channels with subscribers
+- 🛡️ **Privacy Transport Modes** — Direct, Tor (3-hop), Nym Mixnet (5-hop), and Domain-Fronting
+- 💻 **Interactive Shell** — Unified inbox bridging all commands with or without slash prefixes
+- 📎 **File transfer** — images, video, documents (512 KiB / 2MB encrypted chunks + Merkle tree)
+- 🌐 **Decentralized relay** at `wss://signal.tokenkickstarter.com` and HTTP store-and-forward fallback
 - 🔑 **BIP-39 identity** — Ed25519 + X25519 + Sr25519 + secp256k1
 
 ## Quick Start
@@ -23,49 +27,70 @@ sudo cp target/release/cipher-cli /usr/local/bin/
 # Generate identity
 cipher-cli init
 
-# Check your address
+# Check your address & keys
 cipher-cli whoami
 
 # Register username on TKS blockchain (FREE)
 cipher-cli register @ninja
 
-# Send a message
-cipher-cli send 0xRecipientAddress "Hello from Cipher!"
+# Launch unified interactive shell
+cipher-cli shell
 
-# Send a file
-cipher-cli send-file 0xRecipientAddress ./photo.jpg
+# Send a native TKS coin transfer
+cipher-cli transfer @recipient 1.5
 
-# Receive messages
-cipher-cli recv -f
-
-# Interactive chat
-cipher-cli chat 0xPeerAddress
-
-# Check TKS blockchain
-cipher-cli node-info
+# Check TKS balance
 cipher-cli balance
-cipher-cli lookup @ninja
+
+# Manage groups and channels
+cipher-cli group create "Core Team"
+cipher-cli channel create "Announcements" @tks_announcements
+
+# Privacy mode selector (Direct, Tor, Nym, Front, Auto)
+cipher-cli mode tor
 ```
 
 ## All Commands
 
 | Command | Description |
 |---------|-------------|
+| `shell` | Launch interactive chat shell (unified inbox with live dispatch) |
 | `init` | Generate new identity (BIP-39 seed phrase) |
 | `restore` | Restore identity from existing seed phrase |
 | `whoami` | Display your addresses & public keys |
 | `export` | Export seed phrase (with warning) |
+| `login` | Unlock session cache (4 hours) |
+| `logout` | Destroy session cache |
 | `send` | Send encrypted text message |
 | `send-file` | Send encrypted file (image, video, document) |
-| `recv` | Poll for incoming messages |
-| `recv -f` | Live listen mode |
-| `chat` | Interactive bidirectional chat |
+| `recv` | Poll for incoming messages (`-f` for live follow) |
+| `chat` | Interactive bidirectional 1-on-1 chat |
 | `contacts` | List conversation peers |
 | `status` | Network & transport status |
 | `register` | Register @username on TKS blockchain (FREE) |
 | `lookup` | Resolve @username ↔ address on-chain |
 | `balance` | Check TKS token balance |
+| `transfer` | Send TKS native coins to address or @username |
 | `node-info` | Query TKS blockchain node info |
+| `mode` | View or set privacy transport mode (`direct`, `tor`, `nym`, `front`, `auto`) |
+| `group` | Multi-user groups (`create`, `list`, `info`, `add`, `send`, `leave`) |
+| `channel` | Broadcast channels (`create`, `list`, `post`, `sub`, `unsub`) |
+
+### Interactive Shell Commands
+Inside `cipher-cli shell`, all commands work directly with or without a leading slash:
+- `@username <msg>` — Send an encrypted message
+- `/chat <@user>` or `chat <@user>` — Focus on one conversation
+- `/all` or `all` — Show all conversations
+- `/register <@name>` or `register <@name>` — Register username on-chain
+- `/transfer <@user> <amt>` or `transfer <@user> <amt>` — Transfer TKS coins
+- `/balance` or `balance` — Check your TKS balance
+- `/whoami` or `whoami` — Display address & keys
+- `/mode [direct|tor|nym|front|auto]` — Switch privacy routing
+- `/group create|list|send|add|info` — Group chat actions
+- `/channel create|list|post|sub` — Channel broadcast actions
+- `/node-info` or `node-info` — TKS blockchain height & state
+- `/help` or `help` — Show full categorized command help
+- `/quit` or `exit` — Exit shell
 
 ## Architecture
 
