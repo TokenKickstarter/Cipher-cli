@@ -116,7 +116,7 @@ impl Chain {
             Chain::Arbitrum => "https://arb1.arbitrum.io/rpc",
             Chain::Optimism => "https://mainnet.optimism.io",
             Chain::Base => "https://mainnet.base.org",
-            Chain::Substrate => crate::tks_rpc::LOCAL_RPC_WS, // Local TKS dev node
+            Chain::Substrate => "https://rpc.tokenkickstarter.com", // see network bundle for full RPC list
             Chain::Solana => "https://api.mainnet-beta.solana.com",
             Chain::Bitcoin => "https://blockstream.info/api",
         }

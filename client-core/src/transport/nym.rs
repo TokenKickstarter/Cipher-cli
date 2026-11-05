@@ -98,7 +98,8 @@ impl NymTransport {
     /// Create a new Nym transport.
     pub fn new(peer_id: String, config: NymConfig) -> Self {
         let direct_config = DirectTransportConfig::default();
-        let inner = Arc::new(DirectTransport::new(peer_id.clone(), direct_config));
+        let pool = crate::network_bundle::RelayPool::global();
+        let inner = Arc::new(DirectTransport::new(peer_id.clone(), direct_config, pool));
 
         Self {
             inner,

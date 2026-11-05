@@ -38,12 +38,10 @@ use crate::error::CipherError;
 const MIN_USERNAME_LEN: usize = 3;
 const MAX_USERNAME_LEN: usize = 32;
 
-/// TKS node endpoints for registration and resolution.
-/// Local dev node first, remote nodes as fallback.
-const TKS_NODES: &[&str] = &[
-// 10.0.2.2 on Android, 127.0.0.1 otherwise
-    crate::tks_rpc::LOCAL_RPC_WS,
-];
+/// TKS JSON-RPC endpoints from the federated network bundle.
+fn tks_rpc_endpoints() -> Vec<String> {
+    crate::network_bundle::NetworkBundle::global().rpc_http.clone()
+}
 
 /// A registered username entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,7 +129,8 @@ impl UsernameRegistry {
         backend: RegistryBackend
     ) -> Self {
         // Initialize node statuses
-        let statuses: Vec<TksNodeStatus> = TKS_NODES.iter().map(|ep| TksNodeStatus {
+        let nodes = tks_rpc_endpoints();
+        let statuses: Vec<TksNodeStatus> = nodes.iter().map(|ep| TksNodeStatus {
             endpoint: ep.to_string(),
             connected: true, // Optimistic — will verify on first operation
             last_sync: Utc::now(),
@@ -450,13 +449,18 @@ impl UsernameRegistry {
 
     /// Select the best TKS node for an operation.
     async fn select_primary_node(&self) -> String {
-        let statuses = self.node_statuses.read().await;
-        // Prefer connected nodes, pick the one with most recent sync
-        statuses.iter()
-            .filter(|s| s.connected)
-            .max_by_key(|s| s.last_sync)
-            .map(|s| s.endpoint.clone())
-            .unwrap_or_else(|| TKS_NODES[0].to_string())
+        for ep in tks_rpc_endpoints() {
+            let http = ep
+                .replace("ws://", "http://")
+                .replace("wss://", "https://");
+            if crate::tks_rpc::TksRpcClient::new(&http).is_connected() {
+                return ep;
+            }
+        }
+        tks_rpc_endpoints()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "https://rpc.tokenkickstarter.com".into())
     }
 
     /// Submit registration to TKS node (FREE — no gas).
@@ -480,7 +484,14 @@ impl UsernameRegistry {
     /// 4. Gossips the record to all peer TKS nodes via libp2p gossipsub
     /// 5. Returns success — NO GAS COST, NO TRANSACTION FEE
     async fn submit_to_tks_node(&self, record: &UsernameRecord) -> Result<(), CipherError> {
-        let node = record.registered_via.as_deref().unwrap_or(TKS_NODES[0]);
+        let default_node = tks_rpc_endpoints()
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "http://127.0.0.1:9944".into());
+        let node = record
+            .registered_via
+            .as_deref()
+            .unwrap_or(default_node.as_str());
         log::info!(
             "[TKS] Registering @{} → {} on {} (FREE, no gas)",
             record.username, record.address, node
@@ -588,7 +599,7 @@ impl UsernameRegistry {
 
     /// Query TKS nodes to resolve a username — REAL on-chain query.
     async fn query_tks_nodes(&self, username: &str) -> Option<String> {
-        for node_url in TKS_NODES {
+        for node_url in tks_rpc_endpoints() {
             let http_endpoint = node_url
                 .replace("ws://", "http://")
                 .replace("wss://", "https://");
@@ -724,7 +735,7 @@ mod tests {
     async fn test_node_statuses() {
         let reg = UsernameRegistry::new("0xAlice".into(), RegistryBackend::TksNode);
         let statuses = reg.node_statuses().await;
-        assert_eq!(statuses.len(), TKS_NODES.len());
+        assert_eq!(statuses.len(), tks_rpc_endpoints().len());
         assert!(statuses.iter().all(|s| s.connected));
     }
 

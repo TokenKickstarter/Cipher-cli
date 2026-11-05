@@ -28,8 +28,7 @@ pub struct ChannelPost {
 }
 
 pub fn channels_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not determine home directory");
-    home.join(".cipher").join("channels.json")
+    crate::identity_store::cipher_dir().join("channels.json")
 }
 
 pub fn load_channels() -> HashMap<String, ChannelRecord> {

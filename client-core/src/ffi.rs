@@ -738,7 +738,7 @@ pub extern "C" fn cipher_username_resolve(username: *const c_char) -> *mut c_cha
     }
 
     // Fallback: direct RPC query to TKS node (works without engine init)
-    let http_endpoint = crate::tks_rpc::LOCAL_RPC_HTTP;
+    let http_endpoint = crate::tks_rpc::local_rpc_http();
     let rpc = crate::tks_rpc::TksRpcClient::new(&http_endpoint);
     match rpc.query_username(&username) {
         Ok(Some(addr)) => json_ok(serde_json::json!({ "address": addr })),
@@ -753,7 +753,7 @@ pub extern "C" fn cipher_username_reverse(address: *const c_char) -> *mut c_char
     let address = c_str_to_string(address).to_lowercase();
     
     // Fallback to direct RPC query
-    let http_endpoint = crate::tks_rpc::LOCAL_RPC_HTTP;
+    let http_endpoint = crate::tks_rpc::local_rpc_http();
     let rpc = crate::tks_rpc::TksRpcClient::new(&http_endpoint);
     
     // TksRpcClient reverse lookup needs the TKS SS58 address, 
@@ -806,7 +806,7 @@ pub extern "C" fn cipher_username_check(username: *const c_char) -> *mut c_char 
     }
 
     // Fallback: direct RPC query to TKS node (works without engine init)
-    let http_endpoint = crate::tks_rpc::LOCAL_RPC_HTTP;
+    let http_endpoint = crate::tks_rpc::local_rpc_http();
     let rpc = crate::tks_rpc::TksRpcClient::new(&http_endpoint);
     match rpc.query_username(&username) {
         Ok(Some(_)) => json_ok(serde_json::json!({ "available": false, "reason": "taken" })),

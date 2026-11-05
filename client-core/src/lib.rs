@@ -15,6 +15,7 @@ pub mod file_chunker;
 pub mod groups;
 pub mod identity;
 pub mod message;
+pub mod network_bundle;
 pub mod swarm_client;
 pub mod tks_rpc;
 pub mod transport;

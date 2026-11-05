@@ -14,7 +14,7 @@ Send & receive E2EE messages, register usernames on-chain, transfer files — al
 - 🛡️ **Privacy Transport Modes** — Direct, Tor (3-hop), Nym Mixnet (5-hop), and Domain-Fronting
 - 💻 **Interactive Shell** — Unified inbox bridging all commands with or without slash prefixes
 - 📎 **File transfer** — images, video, documents (512 KiB / 2MB encrypted chunks + Merkle tree)
-- 🌐 **Decentralized relay** at `wss://signal.tokenkickstarter.com` and HTTP store-and-forward fallback
+- 🌐 **Federated relays** — `network_bundle.default.json` + `GET /discovery` merge (no single hardcoded relay); see [docs/NETWORK-FEDERATION.md](docs/NETWORK-FEDERATION.md)
 - 🔑 **BIP-39 identity** — Ed25519 + X25519 + Sr25519 + secp256k1
 
 ## Quick Start

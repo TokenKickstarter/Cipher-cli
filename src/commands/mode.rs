@@ -19,8 +19,7 @@ impl Default for CliConfig {
 }
 
 pub fn config_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not determine home directory");
-    home.join(".cipher").join("config.json")
+    crate::identity_store::cipher_dir().join("config.json")
 }
 
 pub fn load_config() -> CliConfig {

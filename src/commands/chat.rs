@@ -50,8 +50,13 @@ pub async fn run(peer: &str) -> Result<(), String> {
     // Spawn a background task to poll & display incoming messages
     let client_recv = client.clone();
     let peer_recv = peer.clone();
+    let poll_direct = client.transport.direct.clone();
     let recv_handle = tokio::spawn(async move {
+        let sender = client_core::transport::direct::DefaultSender {
+            direct: poll_direct.clone(),
+        };
         loop {
+            poll_direct.poll_incoming(&sender).await;
             client_recv.process_incoming().await;
             let messages = client_recv.receive_all().await;
 

@@ -74,7 +74,8 @@ impl TorTransport {
     pub fn new(peer_id: String, config: TorConfig) -> Self {
         // Create inner transport that will route through Tor SOCKS5
         let direct_config = DirectTransportConfig::default();
-        let inner = Arc::new(DirectTransport::new(peer_id.clone(), direct_config));
+        let pool = crate::network_bundle::RelayPool::global();
+        let inner = Arc::new(DirectTransport::new(peer_id.clone(), direct_config, pool));
 
         Self {
             inner,

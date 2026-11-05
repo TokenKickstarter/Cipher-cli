@@ -40,8 +40,7 @@ struct SessionFile {
 
 /// Path to the session file
 fn session_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not determine home directory");
-    home.join(".cipher").join("session")
+    crate::identity_store::cipher_dir().join("session")
 }
 
 /// Create a new session from a CipherIdentity.

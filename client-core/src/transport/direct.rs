@@ -1,13 +1,8 @@
-//! # Direct libp2p Transport
+//! # Federated HTTP relay transport (store / fetch / ack)
 //!
-//! Real peer-to-peer networking using libp2p with:
-//! - WebSocket connection to VPS Storage Swarm relay
-//! - Request/Response for encrypted chunk upload/download
-//! - Kademlia DHT for peer discovery
-//! - Background polling for incoming messages
-//!
-//! Per TKS Blueprint §3.5 — messages are stored as encrypted chunks
-//! on the swarm relay nodes with TTL auto-delete.
+//! Ciphertext is store-and-forwarded via **many** TKS cipher-relay HTTP bases
+//! (`RelayPool` — no single default hostname). Peers are merged from
+//! `network_bundle.default.json`, `CIPHER_NETWORK_BUNDLE`, and `GET /discovery`.
 
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
@@ -15,11 +10,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::error::CipherError;
+use crate::network_bundle::RelayPool;
 use crate::transport::websocket_signal::sealed_mailbox;
-
-/// The VPS relay addresses
-const RELAY_TCP: &str = "/ip4/209.97.165.19/tcp/4001";
-const RELAY_WS: &str = "/ip4/209.97.165.19/tcp/4002/ws";
 
 /// Configuration for the direct transport.
 #[derive(Debug, Clone)]
@@ -37,10 +29,10 @@ pub struct DirectTransportConfig {
 impl Default for DirectTransportConfig {
     fn default() -> Self {
         Self {
-            relay_addrs: vec![RELAY_WS.to_string(), RELAY_TCP.to_string()],
+            relay_addrs: vec![],
             max_stored_messages: 1000,
             message_ttl: 30 * 86400, // 30 days
-            poll_interval_ms: 3000, // 3 seconds — relay is lightweight, Cloudflare handles scaling
+            poll_interval_ms: 3000,
         }
     }
 }
@@ -93,6 +85,26 @@ pub struct MessageOutbox {
     pub delivered_count: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FlushStats {
+    pub delivered: usize,
+    pub failed: usize,
+}
+
+fn store_response_ok(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if v.get("Stored").is_some() {
+        return true;
+    }
+    if v.get("error").is_some() || v.get("Error").is_some() {
+        return false;
+    }
+    // Some relays return bare { "message_id": "..." }
+    v.get("message_id").and_then(|m| m.as_str()).is_some_and(|s| !s.is_empty())
+}
+
 /// A message waiting in the outbox.
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
@@ -136,8 +148,8 @@ pub struct DirectTransport {
     incoming_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     /// Connected peers (tracked via relay)
     pub connected_peers: Arc<RwLock<Vec<String>>>,
-    /// The HTTP relay URL for simple JSON-RPC requests
-    relay_url: String,
+    /// Federated relay bases (failover + discovery merge)
+    relay_pool: Arc<RelayPool>,
     /// Connection state
     pub connection_state: Arc<RwLock<ConnectionState>>,
     /// Running flag
@@ -149,12 +161,9 @@ pub struct DirectTransport {
 }
 
 impl DirectTransport {
-    /// Create a new direct transport with the given config.
-    pub fn new(peer_id: String, config: DirectTransportConfig) -> Self {
+    /// Create a new direct transport with the given config and relay pool.
+    pub fn new(peer_id: String, config: DirectTransportConfig, relay_pool: Arc<RelayPool>) -> Self {
         let (incoming_tx, incoming_rx) = mpsc::channel(1000);
-        // Route through Cloudflare Worker HTTPS proxy for domain fronting.
-        // ISPs see traffic to Cloudflare, not the VPS. WAF requires JSON content-type.
-        let relay_url = "https://signal.tokenkickstarter.com".to_string();
 
         Self {
             peer_id,
@@ -167,7 +176,7 @@ impl DirectTransport {
             incoming_tx,
             incoming_rx: Arc::new(Mutex::new(incoming_rx)),
             connected_peers: Arc::new(RwLock::new(Vec::new())),
-            relay_url,
+            relay_pool,
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             running: Arc::new(RwLock::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -175,12 +184,15 @@ impl DirectTransport {
         }
     }
 
-    /// Flush pending outbox messages to the relay via JSON REST API.
-    pub async fn flush_outbox(&self, sender: &dyn RelaySender) {
-        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    pub fn relay_pool(&self) -> &Arc<RelayPool> {
+        &self.relay_pool
+    }
 
+    /// Flush pending outbox messages to the relay via JSON REST API.
+    pub async fn flush_outbox(&self, _sender: &dyn RelaySender) -> Result<FlushStats, CipherError> {
         let mut outbox = self.outbox.write().await;
         let pending = std::mem::take(&mut outbox.pending);
+        let mut stats = FlushStats::default();
 
         for (recipient, messages) in pending {
             let mut failed_messages = Vec::new();
@@ -188,40 +200,44 @@ impl DirectTransport {
             for mut msg in messages {
                 let recipient_id = sealed_mailbox(&recipient);
                 let message_id = uuid::Uuid::new_v4().to_string();
-                let data_b64 = BASE64.encode(&msg.message);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
 
                 let payload = serde_json::json!({
                     "recipient_id": recipient_id,
                     "message_id": message_id,
-                    "data": data_b64,
-                    "ttl": self.config.message_ttl,
+                    "ciphertext": msg.message,
+                    "stored_at": now,
+                    "expires_at": now + self.config.message_ttl,
                 });
 
-                let url = format!("{}/store", self.relay_url);
                 let body = payload.to_string();
+                let pool = self.relay_pool.clone();
+                let stored = pool.post_json_failover("/store", body, 30).await;
 
-                let result = tokio::task::spawn_blocking(move || {
-                    ureq::post(&url)
-                        .set("Content-Type", "application/json")
-                        .timeout(std::time::Duration::from_secs(30))
-                        .send_string(&body)
-                })
-                .await;
-
-                match result {
-                    Ok(Ok(_resp)) => {
-                        debug!("[Transport] ✅ Stored {} for {}", &message_id[..8], &recipient_id[..12]);
+                match stored {
+                    Some((_base, resp_text)) if store_response_ok(&resp_text) => {
+                        debug!(
+                            "[Transport] ✅ Stored {} for {}",
+                            &message_id[..8.min(message_id.len())],
+                            &recipient_id[..12.min(recipient_id.len())]
+                        );
                         outbox.delivered_count += 1;
+                        stats.delivered += 1;
                     }
-                    Ok(Err(e)) => {
-                        debug!("[Transport] Store failed: {}", e);
+                    Some((_base, resp_text)) => {
+                        warn!("[Transport] Relay rejected store: {}", resp_text.chars().take(120).collect::<String>());
                         msg.retry_count += 1;
                         failed_messages.push(msg);
+                        stats.failed += 1;
                     }
-                    Err(e) => {
-                        debug!("[Transport] Task error: {}", e);
+                    None => {
+                        warn!("[Transport] Store failed on all relays");
                         msg.retry_count += 1;
                         failed_messages.push(msg);
+                        stats.failed += 1;
                     }
                 }
             }
@@ -230,6 +246,20 @@ impl DirectTransport {
                 outbox.pending.insert(recipient, failed_messages);
             }
         }
+
+        if stats.delivered == 0 && stats.failed > 0 {
+            return Err(CipherError::Network(format!(
+                "Could not store {} message(s) on any relay (check network / cipher-cli network)",
+                stats.failed
+            )));
+        }
+        if stats.failed > 0 {
+            warn!(
+                "[Transport] {} delivered, {} failed (will retry in background)",
+                stats.delivered, stats.failed
+            );
+        }
+        Ok(stats)
     }
 
     /// Poll relay for messages addressed to us via JSON REST API.
@@ -237,69 +267,75 @@ impl DirectTransport {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
         let recipient_id = sealed_mailbox(&self.peer_id);
-        let fetch_url = format!("{}/fetch", self.relay_url);
-        let ack_url = format!("{}/ack", self.relay_url);
         let rid = recipient_id.clone();
-
         let fetch_body = serde_json::json!({ "recipient_id": rid }).to_string();
+        let pool = self.relay_pool.clone();
+        let bases = pool.ranked_bases().await;
+        let mut any = false;
 
-        let result = tokio::task::spawn_blocking(move || {
-            ureq::post(&fetch_url)
-                .set("Content-Type", "application/json")
-                .timeout(std::time::Duration::from_secs(10))
-                .send_string(&fetch_body)
-        })
-        .await;
+        for base in bases {
+            let body = fetch_body.clone();
+            let Some(resp_text) = RelayPool::post_to_base(&base, "/fetch", body, 12).await else {
+                continue;
+            };
 
-        match result {
-            Ok(Ok(resp)) => {
-                let body = resp.into_string().unwrap_or_default();
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Some(messages) = parsed["messages"].as_array() {
-                        if messages.is_empty() {
-                            return;
-                        }
-                        info!("[Transport] 📬 Received {} messages from relay", messages.len());
-                        let mut ack_ids: Vec<String> = Vec::new();
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_text) else {
+                continue;
+            };
+            let chunks_opt = parsed
+                .get("Chunks")
+                .and_then(|v| v.as_array())
+                .or_else(|| parsed.get("messages").and_then(|v| v.as_array()));
 
-                        for msg in messages {
-                            if let (Some(mid), Some(data_b64)) = (
-                                msg["message_id"].as_str(),
-                                msg["data"].as_str(),
-                            ) {
-                                ack_ids.push(mid.to_string());
-                                if let Ok(ciphertext) = BASE64.decode(data_b64) {
-                                    let mut inbox = self.inbox.write().await;
-                                    inbox.unread.push(ciphertext);
-                                }
-                            }
-                        }
+            let Some(messages) = chunks_opt else { continue };
+            if messages.is_empty() {
+                continue;
+            }
 
-                        // Ack receipt
-                        if !ack_ids.is_empty() {
-                            let ack_body = serde_json::json!({
-                                "recipient_id": recipient_id,
-                                "message_ids": ack_ids,
-                            }).to_string();
-                            let ack_u = ack_url.clone();
-                            let _ = tokio::task::spawn_blocking(move || {
-                                ureq::post(&ack_u)
-                                    .set("Content-Type", "application/json")
-                                    .timeout(std::time::Duration::from_secs(5))
-                                    .send_string(&ack_body)
-                            }).await;
-                        }
+            any = true;
+            info!(
+                "[Transport] 📬 {} message(s) from relay {}",
+                messages.len(),
+                base
+            );
+            let mut ack_ids: Vec<String> = Vec::new();
 
-                        crate::ffi::notify_dart();
-                    }
+            for msg in messages {
+                let mid = msg["message_id"].as_str().unwrap_or("").to_string();
+                if !mid.is_empty() {
+                    ack_ids.push(mid);
+                }
+
+                let bytes_opt = if let Some(arr) = msg["ciphertext"].as_array() {
+                    Some(
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|b| b as u8))
+                            .collect::<Vec<u8>>(),
+                    )
+                } else if let Some(data_b64) = msg["data"].as_str() {
+                    BASE64.decode(data_b64).ok()
+                } else {
+                    None
+                };
+
+                if let Some(ciphertext) = bytes_opt {
+                    let mut inbox = self.inbox.write().await;
+                    inbox.unread.push(ciphertext);
                 }
             }
-            Ok(Err(e)) => {
-                debug!("[Transport] Poll failed: {}", e);
+
+            if !ack_ids.is_empty() {
+                let ack_body = serde_json::json!({
+                    "recipient_id": recipient_id,
+                    "message_ids": ack_ids,
+                })
+                .to_string();
+                let _ = RelayPool::post_to_base(&base, "/ack", ack_body, 5).await;
             }
-            Err(e) => {
-                debug!("[Transport] Poll task error: {}", e);
-            }
+        }
+
+        if any {
+            crate::ffi::notify_dart();
         }
     }
 
@@ -413,12 +449,26 @@ impl DirectTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network_bundle::{NetworkBundle, RelayPool};
+
+    fn test_pool() -> Arc<RelayPool> {
+        RelayPool::from_bundle(&NetworkBundle {
+            version: 1,
+            bundle_id: "test".into(),
+            http_relays: vec!["http://127.0.0.1:9".into()],
+            signal_ws: vec![],
+            rpc_http: vec![],
+            iroh_relays: vec![],
+            notes: None,
+        })
+    }
 
     #[tokio::test]
     async fn test_queue_and_retrieve() {
         let transport = DirectTransport::new(
             "0xtest-peer-1".to_string(),
             DirectTransportConfig::default(),
+            test_pool(),
         );
 
         // Queue messages
@@ -452,6 +502,7 @@ mod tests {
         let transport = DirectTransport::new(
             "0xtest-peer-2".to_string(),
             DirectTransportConfig::default(),
+            test_pool(),
         );
 
         transport.push_received(vec![10, 20, 30]).await;
@@ -469,6 +520,7 @@ mod tests {
         let transport = DirectTransport::new(
             "0xtest-peer-3".to_string(),
             DirectTransportConfig::default(),
+            test_pool(),
         );
 
         transport.add_peer("peer-a").await;

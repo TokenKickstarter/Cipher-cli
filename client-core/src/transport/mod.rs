@@ -19,6 +19,7 @@ pub mod websocket_signal;
 pub mod iroh_p2p;
 
 use crate::error::CipherError;
+use crate::network_bundle::{NetworkBundle, RelayPool, SignalPool};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -109,9 +110,13 @@ impl TransportRouter {
 
     /// Create a new transport router with an explicit Ed25519 secret key for Iroh.
     pub fn new_with_secret(peer_id: String, secret_key: [u8; 32]) -> Self {
+        let relay_pool = RelayPool::global();
+        let signal_pool = SignalPool::global();
+
         let direct = Arc::new(direct::DirectTransport::new(
             peer_id.clone(),
             direct::DirectTransportConfig::default(),
+            relay_pool.clone(),
         ));
         let iroh = Arc::new(iroh_p2p::IrohTransport::new(
             peer_id.clone(),
@@ -126,7 +131,11 @@ impl TransportRouter {
             nym::NymConfig::default(),
         ));
         let domain_front = Arc::new(domain_front::DomainFrontTransport::new());
-        let ws_signal = Arc::new(websocket_signal::WebSocketSignal::new(peer_id.clone()));
+        let ws_signal = Arc::new(websocket_signal::WebSocketSignal::new(
+            peer_id.clone(),
+            signal_pool,
+            relay_pool.clone(),
+        ));
 
         Self {
             mode: Arc::new(RwLock::new(TransportMode::Direct)),
@@ -143,6 +152,19 @@ impl TransportRouter {
     /// Start the transport router — connects to relay and begins polling.
     pub async fn start(&self) {
         info!("[Router] Starting transport router for {}", self.peer_id);
+
+        let pool = self.direct.relay_pool().clone();
+        let rpcs = NetworkBundle::global().rpc_http.clone();
+        let stats = pool.refresh_network(&rpcs).await;
+        info!(
+            "[Router] Federated pool: {} HTTP relay(s) (+{} chain, +{} discovery), {} signal WS (+{} signal)",
+            stats.pool_size,
+            stats.chain_hints,
+            stats.discovery_hints,
+            stats.signal_pool_size,
+            stats.signal_hints
+        );
+        pool.spawn_periodic_refresh(rpcs);
 
         let mode = self.mode.read().await.clone();
         info!("[Router] Active transport mode: {}", mode);
@@ -274,17 +296,15 @@ impl TransportRouter {
         all
     }
 
-    /// Send a message via MULTIPLE channels for maximum reliability:
-    /// 1. HTTP relay (guaranteed store-and-forward delivery)
-    /// 2. Direct Iroh QUIC stream (zero-hop P2P hole-punched)
-    /// 3. WebSocket (instant delivery if both peers are connected)
+    /// Send via multiple paths: federated HTTP relays, Iroh QUIC, WebSocket signal.
     pub async fn send_signal(&self, recipient: &str, data: Vec<u8>) -> Result<(), CipherError> {
-        // ALWAYS send via HTTP relay for guaranteed delivery
         self.queue_message(recipient, data.clone()).await?;
         // Instantly force flush the outbox using fallback (instead of full trait system)
-        self.direct.flush_outbox(&crate::transport::direct::DefaultSender {
-            direct: self.direct.clone(),
-        }).await;
+        self.direct
+            .flush_outbox(&crate::transport::direct::DefaultSender {
+                direct: self.direct.clone(),
+            })
+            .await?;
 
         // Try direct Iroh QUIC P2P delivery
         let _ = self.iroh.send_to_node(recipient, &data).await;

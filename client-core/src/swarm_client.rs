@@ -126,9 +126,16 @@ impl SwarmClient {
                 transport_for_poll.direct.poll_incoming(&sender).await;
 
                 // Also flush any queued outgoing messages
-                transport_for_poll.direct.flush_outbox(&sender).await;
+                let _ = transport_for_poll.direct.flush_outbox(&sender).await;
 
-                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                let ws_ok = transport_for_poll.ws_signal.is_connected().await;
+                let delay = if ws_ok {
+                    // WS push is primary; HTTP fetch is offline fallback
+                    tokio::time::Duration::from_secs(20)
+                } else {
+                    tokio::time::Duration::from_millis(800)
+                };
+                tokio::time::sleep(delay).await;
             }
         });
 
@@ -244,6 +251,16 @@ impl SwarmClient {
         conv.statuses.insert(msg_id, DeliveryStatus::Queued);
 
         info!("Message {} queued for {}", msg_id, recipient);
+
+        // Immediate flush (~100ms path when relay + WS push are up)
+        let _ = self
+            .transport
+            .direct
+            .flush_outbox(&crate::transport::direct::DefaultSender {
+                direct: self.transport.direct.clone(),
+            })
+            .await;
+
         Ok(msg_id)
     }
 
@@ -336,9 +353,12 @@ impl SwarmClient {
         }
 
         // 3. Flush all messages immediately
-        self.transport.direct.flush_outbox(&crate::transport::direct::DefaultSender {
-            direct: self.transport.direct.clone(),
-        }).await;
+        self.transport
+            .direct
+            .flush_outbox(&crate::transport::direct::DefaultSender {
+                direct: self.transport.direct.clone(),
+            })
+            .await?;
 
         // Track in conversation
         let mut conversations = self.conversations.write().await;

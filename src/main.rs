@@ -4,6 +4,7 @@ use colored::Colorize;
 mod commands;
 mod identity_store;
 mod session;
+mod ui;
 
 /// Cipher CLI — Send & receive E2EE messages from the terminal
 ///
@@ -99,8 +100,23 @@ enum Commands {
     /// List all known conversation peers
     Contacts,
 
-    /// Show transport & network status
+    // ── Network ───────────────────────────────────────────
+
+    /// Transport, relay pool, and inbox summary
     Status,
+
+    /// Federated relays (auto-refresh from TKS + relay discovery)
+    Network {
+        /// Skip live refresh; show bundle bootstrap relays only
+        #[arg(long, default_value_t = false)]
+        bundle_only: bool,
+    },
+
+    /// View or set privacy transport mode (direct, iroh, tor, nym, front, auto)
+    Mode {
+        /// Transport mode: iroh, direct, tor, nym, front, or auto
+        mode: Option<String>,
+    },
 
     // ── TKS Blockchain ────────────────────────────────────
 
@@ -138,12 +154,6 @@ enum Commands {
         amount: String,
     },
 
-    /// View or set privacy transport mode (iroh, direct, tor, nym, front, auto)
-    Mode {
-        /// Transport mode: iroh, direct, tor, nym, front, or auto
-        mode: Option<String>,
-    },
-
     /// Multi-user group management and messaging
     Group {
         /// Action: create, list, add, info, send, leave
@@ -168,25 +178,36 @@ enum Commands {
 }
 
 fn print_banner() {
-    println!();
-    println!("  {} {}", "⚔️ ".bold(), "CIPHER CLI".cyan().bold());
-    println!("  {}", "Decentralized • Anonymous • E2EE".dimmed());
+    ui::blank();
+    println!(
+        "  {}  {}",
+        "⚔".cyan().bold(),
+        "Cipher".white().bold()
+    );
     if session::is_session_active() {
         if let Some(addr) = session::session_address() {
             let remaining = session::session_remaining_secs().unwrap_or(0);
             let hours = remaining / 3600;
             let mins = (remaining % 3600) / 60;
-            let short_addr = if addr.len() > 10 {
-                format!("{}...{}", &addr[..6], &addr[addr.len()-4..])
+            let short = if addr.len() > 14 {
+                format!("{}…{}", &addr[..8], &addr[addr.len() - 4..])
             } else {
                 addr
             };
-            println!("  {} {} {}", "🔓".green(), short_addr.green(), format!("({}h {}m left)", hours, mins).dimmed());
+            println!(
+                "  {}  {}  {}",
+                "session".dimmed(),
+                short.green(),
+                format!("{hours}h {mins}m").dimmed()
+            );
         }
     } else {
-        println!("  {}", "🔒 Locked — run `cipher-cli login` to unlock".dimmed());
+        println!(
+            "  {}  {}",
+            "session".dimmed(),
+            "locked — `cipher-cli login`".dimmed()
+        );
     }
-    println!();
 }
 
 #[tokio::main]
@@ -273,6 +294,9 @@ async fn main() {
         }
         Some(Commands::Channel { action, args }) => {
             commands::channels::run(&action, &args).await
+        }
+        Some(Commands::Network { bundle_only }) => {
+            commands::network::run(bundle_only).await
         }
     };
 

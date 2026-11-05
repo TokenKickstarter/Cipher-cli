@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "bundle_id": "cipher-network-federated-v1",
+  "http_relays": [],
+  "signal_ws": [],
+  "rpc_http": [
+    "http://127.0.0.1:9944"
+  ],
+  "notes": "Relays and signal WebSockets are discovered from tks_listSwarmValidators + GET /discovery on any reachable TKS node. Override with CIPHER_NETWORK_BUNDLE for community bootstrap URLs."
+}

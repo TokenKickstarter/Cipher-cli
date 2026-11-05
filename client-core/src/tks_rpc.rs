@@ -41,20 +41,31 @@ pub fn log_to_file(msg: &str) {
     }
 }
 
-/// Default TKS node RPC endpoint.
-/// Public RPC: https://rpc.tokenkickstarter.com (proxied via Cloudflare)
-/// Fallback direct: http://209.97.165.19:9944
-#[cfg(target_os = "android")]
-pub const LOCAL_RPC_WS: &str = "wss://rpc.tokenkickstarter.com";
-#[cfg(target_os = "android")]
-pub const LOCAL_RPC_HTTP: &str = "https://rpc.tokenkickstarter.com";
+/// Primary TKS JSON-RPC HTTP URL from the federated network bundle.
+pub fn local_rpc_http() -> String {
+    crate::network_bundle::NetworkBundle::global().primary_rpc()
+}
 
-#[cfg(not(target_os = "android"))]
-pub const LOCAL_RPC_WS: &str = "wss://rpc.tokenkickstarter.com";
-#[cfg(not(target_os = "android"))]
-pub const LOCAL_RPC_HTTP: &str = "https://rpc.tokenkickstarter.com";
+/// Primary TKS JSON-RPC WebSocket URL (derived from bundle HTTP list).
+pub fn local_rpc_ws() -> String {
+    let http = local_rpc_http();
+    if http.starts_with("https://") {
+        http.replacen("https://", "wss://", 1)
+    } else if http.starts_with("http://") {
+        http.replacen("http://", "ws://", 1)
+    } else {
+        format!("ws://{http}")
+    }
+}
 
-const DEFAULT_RPC: &str = LOCAL_RPC_HTTP;
+/// Back-compat alias for older call sites.
+pub fn LOCAL_RPC_HTTP() -> String {
+    local_rpc_http()
+}
+
+pub fn LOCAL_RPC_WS() -> String {
+    local_rpc_ws()
+}
 
 /// TKS chain ID for EIP-155 signing (from chain_spec.rs).
 const TKS_CHAIN_ID: u64 = 7779;
@@ -111,7 +122,7 @@ impl TksRpcClient {
     }
 
     pub fn default() -> Self {
-        Self::new(DEFAULT_RPC)
+        Self::new(&local_rpc_http())
     }
 
     /// Make a JSON-RPC call to the TKS node.

@@ -19,7 +19,7 @@ pub fn resolve_recipient(input: &str) -> Result<String, String> {
 
     // Already an 0x address
     if trimmed.starts_with("0x") && trimmed.len() == 42 {
-        return Ok(trimmed.to_string());
+        return Ok(trimmed.to_lowercase());
     }
 
     // Treat as @username — resolve via TKS blockchain

@@ -89,7 +89,7 @@ pub async fn run(address: Option<&str>) -> Result<(), String> {
 fn query_storage(_rpc: &TksRpcClient, key: &str) -> Result<Option<Vec<u8>>, String> {
     // We need to use the raw RPC call mechanism
     // TksRpcClient doesn't expose a raw state_getStorage, so we use ureq directly
-    let endpoint = client_core::tks_rpc::LOCAL_RPC_HTTP;
+    let endpoint = client_core::tks_rpc::local_rpc_http();
     let request = serde_json::json!({
         "id": 1,
         "jsonrpc": "2.0",
@@ -97,7 +97,7 @@ fn query_storage(_rpc: &TksRpcClient, key: &str) -> Result<Option<Vec<u8>>, Stri
         "params": [key]
     });
 
-    let resp = ureq::post(endpoint)
+    let resp = ureq::post(&endpoint)
         .timeout(std::time::Duration::from_secs(10))
         .set("Content-Type", "application/json")
         .send_string(&request.to_string())

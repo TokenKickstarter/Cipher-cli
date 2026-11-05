@@ -38,8 +38,13 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     let sender = client_core::transport::direct::DefaultSender {
         direct: client.transport.direct.clone(),
     };
-    client.transport.direct.flush_outbox(&sender).await;
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    client
+        .transport
+        .direct
+        .flush_outbox(&sender)
+        .await
+        .map_err(|e| format!("Relay store failed: {e}"))?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     println!();
     println!("  {} Message sent!", "✓".green().bold());

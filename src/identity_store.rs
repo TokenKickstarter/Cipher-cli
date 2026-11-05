@@ -27,10 +27,19 @@ struct EncryptedIdentity {
     version: u32,
 }
 
-/// Get the identity file path (~/.cipher/identity.json)
+/// Get the base cipher directory (~/.cipher or $CIPHER_DIR)
+pub fn cipher_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("CIPHER_DIR") {
+        PathBuf::from(dir)
+    } else {
+        let home = dirs::home_dir().expect("Could not determine home directory");
+        home.join(".cipher")
+    }
+}
+
+/// Get the identity file path (~/.cipher/identity.json or $CIPHER_DIR/identity.json)
 pub fn identity_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not determine home directory");
-    home.join(".cipher").join("identity.json")
+    cipher_dir().join("identity.json")
 }
 
 /// Check if an identity file already exists
@@ -143,8 +152,13 @@ pub fn load_identity(password: &str) -> Result<CipherIdentity, String> {
         .map_err(|e| format!("Failed to restore identity: {e}"))
 }
 
-/// Prompt for a password from stdin (hides input)
+/// Prompt for a password from stdin (hides input) or $CIPHER_PASSWORD env var
 pub fn prompt_password(prompt: &str) -> String {
+    if let Ok(pw) = std::env::var("CIPHER_PASSWORD") {
+        if !pw.is_empty() {
+            return pw;
+        }
+    }
     rpassword::prompt_password_stderr(prompt).unwrap_or_default()
 }
 

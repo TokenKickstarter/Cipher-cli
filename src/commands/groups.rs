@@ -19,8 +19,7 @@ pub struct GroupRecord {
 }
 
 pub fn groups_path() -> PathBuf {
-    let home = dirs::home_dir().expect("Could not determine home directory");
-    home.join(".cipher").join("groups.json")
+    crate::identity_store::cipher_dir().join("groups.json")
 }
 
 pub fn load_groups() -> HashMap<String, GroupRecord> {
