@@ -112,6 +112,45 @@ impl NetworkBundle {
 }
 
 /// Derive federated signal WebSocket URL from HTTP relay base (same-host `/ws` pattern).
+/// Shard ingest vhosts (e.g. `shard.example.com`, `:4010`) are not cipher mailboxes.
+pub fn endpoint_is_mailbox_http(http: &str) -> bool {
+    let h = http.trim().to_lowercase();
+    if h.is_empty() {
+        return false;
+    }
+    !(h.contains("shard.") || h.contains(":4010"))
+}
+
+/// POST `/fetch` response from a real cipher-relay (includes `Chunks`, even when empty).
+pub fn fetch_response_is_mailbox_api(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    if v.get("Chunks").is_some() {
+        return true;
+    }
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return !err.eq_ignore_ascii_case("not found");
+    }
+    false
+}
+
+fn probe_mailbox_base_sync(base: &str) -> bool {
+    if !endpoint_is_mailbox_http(base) {
+        return false;
+    }
+    let url = format!("{}/fetch", base.trim_end_matches('/'));
+    let body = r#"{"recipient_id":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
+    match ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .timeout(Duration::from_secs(3))
+        .send_string(body)
+    {
+        Ok(resp) => fetch_response_is_mailbox_api(&resp.into_string().unwrap_or_default()),
+        Err(_) => false,
+    }
+}
+
 pub fn http_base_to_signal_ws(http: &str) -> Option<String> {
     let http = http.trim().trim_end_matches('/');
     if http.is_empty() {
@@ -206,6 +245,9 @@ impl SignalPool {
         self.merge_urls(bundle.signal_ws.clone()).await;
 
         for http in relay_pool.snapshot().await {
+            if !endpoint_is_mailbox_http(&http) {
+                continue;
+            }
             if let Some(ws) = http_base_to_signal_ws(&http) {
                 self.merge_urls(vec![ws]).await;
             }
@@ -379,6 +421,10 @@ impl RelayPool {
         let mut bases = self.bases.write().await;
         let mut added = 0usize;
         for u in NetworkBundle::normalize_http_bases(extra) {
+            if !endpoint_is_mailbox_http(&u) {
+                debug!("[RelayPool] skip shard/non-mailbox {}", u);
+                continue;
+            }
             if !bases.iter().any(|x| x == &u) {
                 debug!("[RelayPool] +relay {}", u);
                 bases.push(u);
@@ -426,7 +472,7 @@ impl RelayPool {
     ) -> Option<(String, String)> {
         let rpcs = NetworkBundle::global().rpc_http.clone();
         self.ensure_fresh(&rpcs).await;
-        let bases = self.ranked_bases().await;
+        let bases = self.ranked_mailbox_bases().await;
         for base in bases {
             let url = format!("{base}{path}");
             let body_clone = body.clone();
@@ -552,7 +598,9 @@ impl RelayPool {
                     continue;
                 }
                 if let Some(http) = Self::endpoint_to_http_relay(&val.endpoint) {
-                    found.push(http);
+                    if endpoint_is_mailbox_http(&http) {
+                        found.push(http);
+                    }
                 }
             }
         }
@@ -594,24 +642,27 @@ impl RelayPool {
         }
     }
 
-    /// HTTP relay bases sorted by GET /version RTT (nearest first).
-    pub async fn ranked_bases(&self) -> Vec<String> {
-        let bases = self.snapshot().await;
-        if bases.len() <= 1 {
+    /// Mailbox-capable relay bases (excludes shard ingest), RTT-ranked via fast `/fetch` probe.
+    pub async fn ranked_mailbox_bases(&self) -> Vec<String> {
+        let bases: Vec<String> = self
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|b| endpoint_is_mailbox_http(b))
+            .collect();
+        if bases.is_empty() {
+            return bases;
+        }
+        if bases.len() == 1 {
             return bases;
         }
         let mut scored: Vec<(u64, String)> = Vec::new();
         for base in bases {
-            let url = format!("{base}/version");
+            let b = base.clone();
             let start = Instant::now();
-            let ok = tokio::task::spawn_blocking(move || {
-                ureq::get(&url)
-                    .timeout(Duration::from_secs(2))
-                    .call()
-                    .is_ok()
-            })
-            .await
-            .unwrap_or(false);
+            let ok = tokio::task::spawn_blocking(move || probe_mailbox_base_sync(&b))
+                .await
+                .unwrap_or(false);
             let ms = if ok {
                 start.elapsed().as_millis() as u64
             } else {
@@ -623,6 +674,36 @@ impl RelayPool {
         scored.into_iter().map(|(_, b)| b).collect()
     }
 
+    /// Parallel POST `/fetch` on all mailbox relays (3s each); returns successful responses.
+    pub async fn post_fetch_parallel(
+        &self,
+        body: String,
+        timeout_secs: u64,
+    ) -> Vec<(String, String)> {
+        let rpcs = NetworkBundle::global().rpc_http.clone();
+        self.ensure_fresh(&rpcs).await;
+        let bases = self.ranked_mailbox_bases().await;
+        let mut handles = Vec::new();
+        for base in bases {
+            let body = body.clone();
+            handles.push(tokio::spawn(async move {
+                let text = Self::post_to_base(&base, "/fetch", body, timeout_secs).await?;
+                if fetch_response_is_mailbox_api(&text) {
+                    Some((base, text))
+                } else {
+                    None
+                }
+            }));
+        }
+        let mut out = Vec::new();
+        for h in handles {
+            if let Ok(Some(pair)) = h.await {
+                out.push(pair);
+            }
+        }
+        out
+    }
+
     /// Pull extra relay URLs from `GET /discovery` on known peers (TKS cipher-relay format).
     async fn refresh_from_discovery(&self) -> usize {
         let responses = self.get_json_all("/discovery", 12).await;
@@ -632,7 +713,14 @@ impl RelayPool {
                 if let Some(arr) = v.get("relays").and_then(|r| r.as_array()) {
                     for item in arr {
                         if let Some(http) = item.get("http_base").and_then(|h| h.as_str()) {
-                            if !http.is_empty() {
+                            if http.is_empty() {
+                                continue;
+                            }
+                            let mailbox = item
+                                .get("message_relay")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+                            if mailbox && endpoint_is_mailbox_http(http) {
                                 found.push(http.to_string());
                             }
                         }
@@ -655,6 +743,18 @@ impl RelayPool {
 #[cfg(test)]
 mod tests {
     use super::RelayPool;
+
+    #[test]
+    fn fetch_response_detects_mailbox_vs_shard() {
+        assert!(super::fetch_response_is_mailbox_api(r#"{"Chunks":[]}"#));
+        assert!(!super::fetch_response_is_mailbox_api(r#"{"error":"not found"}"#));
+    }
+
+    #[test]
+    fn endpoint_is_mailbox_http_excludes_shard_hosts() {
+        assert!(!super::endpoint_is_mailbox_http("https://shard.tokenkickstarter.com"));
+        assert!(super::endpoint_is_mailbox_http("https://relay.tokenkickstarter.com"));
+    }
 
     #[test]
     fn endpoint_to_http_relay_parses_https_and_multiaddr() {

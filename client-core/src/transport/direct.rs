@@ -270,15 +270,12 @@ impl DirectTransport {
         let rid = recipient_id.clone();
         let fetch_body = serde_json::json!({ "recipient_id": rid }).to_string();
         let pool = self.relay_pool.clone();
-        let bases = pool.ranked_bases().await;
+        let responses = pool
+            .post_fetch_parallel(fetch_body, 3)
+            .await;
         let mut any = false;
 
-        for base in bases {
-            let body = fetch_body.clone();
-            let Some(resp_text) = RelayPool::post_to_base(&base, "/fetch", body, 12).await else {
-                continue;
-            };
-
+        for (base, resp_text) in responses {
             let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_text) else {
                 continue;
             };

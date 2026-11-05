@@ -32,7 +32,7 @@ export CIPHER_NETWORK_BUNDLE=/path/to/my-network.json
 1. **On-chain** — for each `rpc_http` URL, JSON-RPC **`tks_listSwarmValidators`**.  
    Active validators’ `endpoint` field is merged (HTTPS as-is, or libp2p `/ip4/…/tcp/4002` → `http://host:4002`).
 
-2. **Relay mesh** — **`GET /discovery`** on every known HTTP relay; merge `relays[].http_base` and `relays[].signal_ws`.
+2. **Relay mesh** — **`GET /discovery`** on every known HTTP relay; merge `relays[].http_base` where **`message_relay: true`** (shard ingest hosts are excluded).
 
 3. **Signal WebSocket pool** — same discovery pass builds an RTT-ranked list of `wss://…/ws` endpoints (nearest first). Persistent WS + relay **`/internal/push`** after **`/store`** targets ~100ms delivery when both peers use a nearby validator.
 
