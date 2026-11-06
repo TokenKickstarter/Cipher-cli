@@ -13,11 +13,7 @@ pub async fn run(query: &str) -> Result<(), String> {
         // Reverse lookup: address → @username
         println!("  {} Reverse lookup: address → @username", "🔍".cyan());
 
-        let rpc = TksRpcClient::default();
-
-        if !rpc.is_connected() {
-            return Err("Cannot connect to TKS node at rpc.tokenkickstarter.com".to_string());
-        }
+        let rpc = TksRpcClient::first_reachable().map_err(|e| e.to_string())?;
 
         match rpc.query_username_reverse(query) {
             Ok(Some(username)) => {
@@ -39,11 +35,7 @@ pub async fn run(query: &str) -> Result<(), String> {
         let clean_name = query.trim_start_matches('@').to_lowercase();
         println!("  {} Forward lookup: @{} → address", "🔍".cyan(), clean_name);
 
-        let rpc = TksRpcClient::default();
-
-        if !rpc.is_connected() {
-            return Err("Cannot connect to TKS node at rpc.tokenkickstarter.com".to_string());
-        }
+        let rpc = TksRpcClient::first_reachable().map_err(|e| e.to_string())?;
 
         match rpc.query_username(&clean_name) {
             Ok(Some(address)) => {

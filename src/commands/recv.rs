@@ -21,12 +21,13 @@ pub async fn run(follow: bool, interval: u64) -> Result<(), String> {
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
 
+    client_core::network_bundle::ensure_federated_pools().await;
+
     let poll_sender = client_core::transport::direct::DefaultSender {
         direct: client.transport.direct.clone(),
     };
 
-    // Wait for transport + relay pool refresh
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     loop {
         client

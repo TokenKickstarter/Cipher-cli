@@ -192,6 +192,57 @@ impl TksRpcClient {
         }
     }
 
+    /// JSON-RPC endpoints from the federated network bundle (http/wss normalized to http).
+    pub fn endpoints_from_bundle() -> Vec<String> {
+        crate::network_bundle::NetworkBundle::global()
+            .rpc_http
+            .iter()
+            .map(|u| {
+                u.trim()
+                    .replace("ws://", "http://")
+                    .replace("wss://", "https://")
+            })
+            .filter(|u| !u.is_empty())
+            .collect()
+    }
+
+    /// First reachable RPC in the bundle, or error listing all tried URLs.
+    pub fn first_reachable() -> Result<Self, CipherError> {
+        let endpoints = Self::endpoints_from_bundle();
+        for ep in &endpoints {
+            let client = Self::new(ep);
+            if client.is_connected() {
+                return Ok(client);
+            }
+        }
+        Err(CipherError::Network(format!(
+            "No reachable TKS RPC in network bundle (tried {} URL(s))",
+            endpoints.len()
+        )))
+    }
+
+    /// Try each bundle RPC until `method` succeeds.
+    pub fn call_failover(
+        method: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, CipherError> {
+        let endpoints = Self::endpoints_from_bundle();
+        let mut last_err = None;
+        for ep in endpoints {
+            let client = Self::new(&ep);
+            match client.call(method, params.clone()) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    log::debug!("[TKS RPC] {ep} {method} failed: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            CipherError::Network("No RPC endpoints configured in network bundle".into())
+        }))
+    }
+
     /// Check if the TKS node is reachable (fast — 3s timeout).
     pub fn is_connected(&self) -> bool {
         let id = self

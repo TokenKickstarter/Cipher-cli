@@ -1,5 +1,16 @@
 # Federated Cipher network (no single relay)
 
+## Design
+
+| Layer | Behavior |
+|--------|----------|
+| **Bootstrap** | Default bundle may hardcode RPC + relay + signal URLs (mirrors when your infra is up). |
+| **Directory** | **`tks_listSwarmValidators`** + **`GET /discovery`** + libp2p gossip → merged pools. |
+| **Mailbox** | Federated HTTP **`/store` / `/fetch` / `/ack`** with RTT rank and failover. |
+| **Fast path** | Federated **WSS** (optional); **HTTP always works** if any relay in the pool is live. |
+
+Hardcoded hostnames are **hints**, not the protocol. If bootstrap relays die but other validators are registered on-chain, clients refresh and use those.
+
 Cipher clients load **`client-core/network_bundle.default.json`** or a custom file:
 
 ```bash

@@ -38,11 +38,7 @@ pub async fn run(peer: &str) -> Result<(), String> {
     let client = Arc::new(SwarmClient::new(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
-
-    // Wait for transport to connect
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    println!("  {} Connected to relay", "✓".green());
+    super::network::print_connect_status(&client).await;
     println!();
     print!("  {} ", "▶".green().bold());
     let _ = io::stdout().flush();

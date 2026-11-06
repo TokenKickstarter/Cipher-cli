@@ -1,12 +1,12 @@
 //! `cipher-cli transfer` — Send TKS tokens to an address or @username
 
 use colored::Colorize;
+use client_core::tks_rpc::TksRpcClient;
 use serde_json::json;
 use sha3::{Digest, Keccak256};
 use crate::identity_store;
 
 const TKS_CHAIN_ID: u64 = 7779;
-const RPC_ENDPOINT: &str = "https://rpc.tokenkickstarter.com";
 
 pub async fn run(recipient: &str, amount_str: &str) -> Result<(), String> {
     let identity = identity_store::get_identity()?;
@@ -158,31 +158,11 @@ fn parse_hex_u64(s: &str) -> Result<u64, String> {
 }
 
 fn rpc_call(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params,
-        "id": 1
-    });
-
-    let resp = ureq::post(RPC_ENDPOINT)
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "cipher-cli/0.1.1")
-        .send_json(body)
-        .map_err(|e| format!("RPC network error: {}", e))?;
-
-    let json_resp: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("Failed to parse RPC response: {}", e))?;
-
-    if let Some(err) = json_resp.get("error") {
-        return Err(format!("RPC error: {}", err["message"].as_str().unwrap_or("unknown")));
-    }
-
-    json_resp
-        .get("result")
-        .cloned()
-        .ok_or_else(|| "Missing result in RPC response".to_string())
+    let params_vec = match params {
+        serde_json::Value::Array(a) => a,
+        other => vec![other],
+    };
+    TksRpcClient::call_failover(method, params_vec).map_err(|e| e.to_string())
 }
 
 // ─── Lightweight RLP Encoding ──────────────────────────────────────────

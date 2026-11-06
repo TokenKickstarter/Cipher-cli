@@ -5,6 +5,7 @@ use client_core::username_registry::{UsernameRegistry, RegistryBackend, Username
 use crate::identity_store;
 
 pub async fn run(username: &str) -> Result<(), String> {
+    client_core::network_bundle::ensure_federated_pools().await;
     let identity = identity_store::get_identity()?;
 
     let our_addr = identity.evm_address();

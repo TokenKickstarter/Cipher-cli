@@ -460,7 +460,7 @@ impl UsernameRegistry {
         tks_rpc_endpoints()
             .first()
             .cloned()
-            .unwrap_or_else(|| "https://rpc.tokenkickstarter.com".into())
+            .unwrap_or_else(|| crate::network_bundle::NetworkBundle::global().primary_rpc())
     }
 
     /// Submit registration to TKS node (FREE — no gas).

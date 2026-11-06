@@ -126,13 +126,23 @@ impl WebSocketSignal {
 
         let mut backoff_ms: u64 = 1000;
         let max_backoff_ms: u64 = 30000;
+        let mut empty_signal_logged = false;
 
         loop {
             let ws_urls = signal_pool.ordered_urls().await;
             if ws_urls.is_empty() {
-                warn!("[WS] No signal endpoints yet — waiting for federated discovery…");
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                continue;
+                let rpcs = crate::network_bundle::NetworkBundle::global().rpc_http.clone();
+                relay_pool.ensure_fresh(&rpcs).await;
+                if signal_pool.len().await == 0 {
+                    if !empty_signal_logged {
+                        info!(
+                            "[WS] No signal WebSocket yet (optional for ~100ms push); using HTTP relay fetch until discovery adds wss://…"
+                        );
+                        empty_signal_logged = true;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    continue;
+                }
             }
 
             let idx = *ws_index.read().await;

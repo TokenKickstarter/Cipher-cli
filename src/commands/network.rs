@@ -74,3 +74,24 @@ pub async fn run(bundle_only: bool) -> Result<(), String> {
     ui::blank();
     Ok(())
 }
+
+/// After `start_sync_daemon`, wait for federated relay discovery and print an honest status line.
+pub async fn print_connect_status(client: &std::sync::Arc<client_core::swarm_client::SwarmClient>) {
+    let _ = client;
+    let _stats = client_core::network_bundle::ensure_federated_pools().await;
+    let pool = RelayPool::global();
+    let relays = pool.snapshot().await;
+    if relays.is_empty() {
+        println!(
+            "  {} No relay in pool — set {} or ensure RPC reaches mainnet",
+            "!".yellow(),
+            "CIPHER_NETWORK_BUNDLE".cyan()
+        );
+    } else {
+        println!(
+            "  {} Ready ({} HTTP relay(s); WS push optional)",
+            "✓".green(),
+            relays.len()
+        );
+    }
+}

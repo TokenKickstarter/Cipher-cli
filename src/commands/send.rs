@@ -25,8 +25,10 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
 
+    client_core::network_bundle::ensure_federated_pools().await;
+
     // Give transport a moment to connect
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Send the message
     let msg_id = client

@@ -355,7 +355,9 @@ impl RelayPool {
     fn new_from_bundle(bundle: &NetworkBundle) -> Self {
         let bases = NetworkBundle::normalize_http_bases(bundle.http_relays.clone());
         if bases.is_empty() {
-            warn!("[RelayPool] Bundle has zero http_relays — messaging will fail until discovery runs");
+            info!(
+                "[RelayPool] Federated bootstrap: no static http_relays — merging from chain + /discovery on first connect"
+            );
         } else {
             info!(
                 "[RelayPool] {} bootstrap HTTP relay(s): {}",
@@ -738,6 +740,14 @@ impl RelayPool {
         }
         n
     }
+}
+
+/// Merge bootstrap bundle + on-chain swarm list + relay `/discovery` into global HTTP/WSS pools.
+pub async fn ensure_federated_pools() -> NetworkRefreshStats {
+    let bundle = NetworkBundle::global();
+    RelayPool::global()
+        .refresh_network(&bundle.rpc_http)
+        .await
 }
 
 #[cfg(test)]

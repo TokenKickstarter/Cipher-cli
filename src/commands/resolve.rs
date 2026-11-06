@@ -34,12 +34,10 @@ pub fn resolve_recipient(input: &str) -> Result<String, String> {
 
     eprint!("  {} Resolving @{}...", "🔍".dimmed(), username);
 
-    let rpc = TksRpcClient::default();
-
-    if !rpc.is_connected() {
+    let rpc = TksRpcClient::first_reachable().map_err(|e| {
         eprintln!();
-        return Err("Cannot connect to TKS node at rpc.tokenkickstarter.com".to_string());
-    }
+        e.to_string()
+    })?;
 
     match rpc.query_username(&username) {
         Ok(Some(address)) => {

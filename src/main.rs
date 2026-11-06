@@ -13,7 +13,7 @@ mod ui;
 /// Powered by the TKS blockchain for identity, usernames, and tokenomics.
 #[derive(Parser)]
 #[command(name = "cipher-cli")]
-#[command(version = "0.2.2")]
+#[command(version = "0.2.3")]
 #[command(about = "⚔️  Cipher CLI — Encrypted messaging from the terminal", long_about = None)]
 struct Cli {
     #[command(subcommand)]

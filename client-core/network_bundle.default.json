@@ -1,10 +1,16 @@
 {
   "version": 1,
   "bundle_id": "cipher-network-federated-v1",
-  "http_relays": [],
-  "signal_ws": [],
+  "http_relays": [
+    "https://relay.tokenkickstarter.com"
+  ],
+  "signal_ws": [
+    "wss://signal.tokenkickstarter.com/ws",
+    "wss://relay.tokenkickstarter.com/ws"
+  ],
   "rpc_http": [
+    "https://rpc.tokenkickstarter.com",
     "http://127.0.0.1:9944"
   ],
-  "notes": "Relays and signal WebSockets are discovered from tks_listSwarmValidators + GET /discovery on any reachable TKS node. Override with CIPHER_NETWORK_BUNDLE for community bootstrap URLs."
+  "notes": "Bootstrap mirrors (optional if your infra is down). Runtime directory = tks_listSwarmValidators + GET /discovery + libp2p gossip merged into RelayPool/SignalPool. Override with CIPHER_NETWORK_BUNDLE."
 }

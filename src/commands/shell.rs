@@ -50,10 +50,7 @@ pub async fn run() -> Result<(), String> {
     let client = Arc::new(SwarmClient::new(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
-
-    // Wait for transport
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    println!("  {} Connected to relay", "✓".green());
+    crate::commands::network::print_connect_status(&client).await;
     println!();
 
     // Contacts cache

@@ -16,11 +16,7 @@ pub async fn run(address: Option<&str>) -> Result<(), String> {
     println!();
     println!("{}", format!("Querying balance for {}...", query_addr).yellow());
 
-    let rpc = TksRpcClient::default();
-
-    if !rpc.is_connected() {
-        return Err("Cannot connect to TKS node at rpc.tokenkickstarter.com".to_string());
-    }
+    let rpc = TksRpcClient::first_reachable().map_err(|e| e.to_string())?;
 
     // Query the System.Account storage for this address
     // Storage key: twox128("System") ++ twox128("Account") ++ blake2_128_concat(address_bytes)
