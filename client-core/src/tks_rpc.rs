@@ -111,13 +111,19 @@ pub struct RuntimeVersion {
 pub struct TksRpcClient {
     endpoint: String,
     request_id: std::sync::atomic::AtomicU64,
+    agent: ureq::Agent,
 }
 
 impl TksRpcClient {
     pub fn new(endpoint: &str) -> Self {
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
         Self {
             endpoint: endpoint.to_string(),
             request_id: std::sync::atomic::AtomicU64::new(1),
+            agent,
         }
     }
 
@@ -154,8 +160,10 @@ impl TksRpcClient {
         log::debug!("{}", log_msg);
         log_to_file(&log_msg);
 
-        // Add 10-second timeout to prevent hangs
-        let resp_result = ureq::post(&self.endpoint)
+        // Add 10-second timeout on pooled agent to reuse HTTP/TLS connections across calls
+        let resp_result = self
+            .agent
+            .post(&self.endpoint)
             .timeout(std::time::Duration::from_secs(10))
             .set("Content-Type", "application/json")
             .send_string(&body);
@@ -259,8 +267,10 @@ impl TksRpcClient {
             Err(_) => return false,
         };
 
-        // Use a short 3-second timeout for connectivity checks
-        match ureq::post(&self.endpoint)
+        // Use a short 3-second timeout on pooled agent for connectivity checks
+        match self
+            .agent
+            .post(&self.endpoint)
             .timeout(std::time::Duration::from_secs(3))
             .set("Content-Type", "application/json")
             .send_string(&body)

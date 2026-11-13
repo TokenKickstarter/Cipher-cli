@@ -11,17 +11,30 @@
 //!   → Nym/Tor/Direct delivery
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use log::{info, debug};
 
-use crate::encryption::{DoubleRatchet, PrekeyBundle, x3dh_initiate, aes_encrypt};
+use crate::encryption::{
+    aes_decrypt, aes_encrypt, x3dh_initiate, x3dh_respond, DoubleRatchet, EncryptedMessage,
+    RatchetMessage, X3dhHandshakeHeader,
+};
 use crate::error::CipherError;
 use crate::identity::CipherIdentity;
 use crate::message::{CipherMessage, MessageId, MessageType, ReceiptType, PresenceInfo};
+use crate::network_bundle::{RelayPool, SignalPool};
+use crate::peer_directory::{derive_signed_prekey, PeerDirectory, SignedPeerBundle};
 use crate::transport::direct::DirectTransportConfig;
 use crate::transport::{TransportRouter, TransportMode};
+
+fn is_valid_evm_address(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    trimmed.starts_with("0x")
+        && trimmed.len() == 42
+        && trimmed[2..].chars().all(|c| c.is_ascii_hexdigit())
+}
 
 /// Peer presence state tracked locally.
 #[derive(Debug, Clone)]
@@ -70,6 +83,16 @@ pub struct SwarmClient {
     pub presence_enabled: Arc<RwLock<bool>>,
     /// File chunk reassembly buffer: file_id → (sender, expected_total, collected_chunks)
     chunk_buffer: Arc<RwLock<HashMap<String, ChunkAssembly>>>,
+    /// Notifies local readers (`recv --follow`, `chat`, `shell`) when new inbox messages arrive.
+    pub inbox_notify: Arc<Notify>,
+    /// Authenticated EVM <-> Ed25519/X25519 peer directory + cache.
+    pub peer_directory: Arc<PeerDirectory>,
+    /// Deterministic medium-term X25519 signed prekey for answering X3DH handshakes.
+    signed_prekey: x25519_dalek::StaticSecret,
+    /// Out-of-order ratcheted messages waiting for their peer's `KeyExchange` envelope.
+    pending_ratchet: Arc<RwLock<HashMap<String, Vec<CipherMessage>>>>,
+    /// Optional disk directory for persisting active `DoubleRatchet` sessions across CLI calls.
+    session_dir: Option<PathBuf>,
 }
 
 /// In-progress file chunk assembly
@@ -81,12 +104,9 @@ struct ChunkAssembly {
 }
 
 impl SwarmClient {
-    /// Create a new swarm client.
-    pub fn new(identity: CipherIdentity) -> Self {
+    fn from_router(identity: CipherIdentity, transport: TransportRouter) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(1000);
-        let peer_id = identity.display_address();
-        let secret_bytes = identity.ed25519_secret_bytes();
-        let transport = TransportRouter::new_with_secret(peer_id, secret_bytes);
+        let signed_prekey = derive_signed_prekey(&identity);
 
         Self {
             identity,
@@ -95,30 +115,178 @@ impl SwarmClient {
             sent_log: Arc::new(RwLock::new(HashMap::new())),
             inbox: Arc::new(RwLock::new(Vec::new())),
             media_tx: tx,
-            seen_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            seen_ids: Arc::new(RwLock::new(HashSet::new())),
             peer_presence: Arc::new(RwLock::new(HashMap::new())),
             presence_enabled: Arc::new(RwLock::new(true)),
             chunk_buffer: Arc::new(RwLock::new(HashMap::new())),
+            inbox_notify: Arc::new(Notify::new()),
+            peer_directory: Arc::new(PeerDirectory::new()),
+            signed_prekey,
+            pending_ratchet: Arc::new(RwLock::new(HashMap::new())),
+            session_dir: None,
         }
+    }
+
+    /// Create a new swarm client (honoring persisted transport mode).
+    pub fn new(identity: CipherIdentity) -> Self {
+        let peer_id = identity.display_address();
+        let secret_bytes = identity.ed25519_secret_bytes();
+        let transport = TransportRouter::new_with_secret(peer_id, secret_bytes);
+        Self::from_router(identity, transport)
+    }
+
+    /// Create a new swarm client with an explicit transport mode.
+    pub fn with_mode(identity: CipherIdentity, mode: TransportMode) -> Self {
+        let peer_id = identity.display_address();
+        let secret_bytes = identity.ed25519_secret_bytes();
+        let transport = TransportRouter::new_with_mode(peer_id, secret_bytes, mode);
+        Self::from_router(identity, transport)
+    }
+
+    /// Create a new swarm client with explicit transport mode and relay/signal pools.
+    pub fn with_mode_and_pools(
+        identity: CipherIdentity,
+        mode: TransportMode,
+        relay_pool: Arc<RelayPool>,
+        signal_pool: Arc<SignalPool>,
+    ) -> Self {
+        let peer_id = identity.display_address();
+        let secret_bytes = identity.ed25519_secret_bytes();
+        let transport = TransportRouter::new_with_mode_and_pools(
+            peer_id,
+            secret_bytes,
+            mode,
+            relay_pool,
+            signal_pool,
+        );
+        Self::from_router(identity, transport)
+    }
+
+    /// Enable persistent on-disk storage for Double Ratchet sessions (used by CLI).
+    pub fn with_session_dir(mut self, dir: PathBuf) -> Self {
+        self.session_dir = Some(dir);
+        self
+    }
+
+    /// Publish our dual-signed `SignedPeerBundle` (Iroh `EndpointId` + X3DH `PrekeyBundle`)
+    /// so upgraded peers can connect directly via QUIC P2P and establish Double Ratchet sessions.
+    pub async fn publish_peer_bundle(&self) -> Result<(), CipherError> {
+        self.peer_directory
+            .publish(self.transport.direct.relay_pool(), &self.identity)
+            .await
+    }
+
+    /// Resolve and verify a peer's `SignedPeerBundle`, registering their Iroh `EndpointId`.
+    pub async fn ensure_peer_resolved(&self, recipient: &str) -> Option<SignedPeerBundle> {
+        let bundle = if let Some(cached) = self.peer_directory.get_cached(recipient).await {
+            Some(cached)
+        } else if is_valid_evm_address(recipient) {
+            self.peer_directory
+                .resolve(self.transport.direct.relay_pool(), recipient)
+                .await
+        } else {
+            None
+        };
+
+        if let Some(ref b) = bundle {
+            if let Ok(eid) = b.iroh_endpoint_id() {
+                self.transport.iroh.register_peer_endpoint(recipient, eid).await;
+            }
+        }
+        bundle
+    }
+
+    fn session_file_path(&self, peer: &str) -> Option<PathBuf> {
+        self.session_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.ratchet.json", peer.trim().to_lowercase())))
+    }
+
+    async fn find_conversation_key(
+        conversations: &HashMap<String, Conversation>,
+        peer: &str,
+    ) -> Option<String> {
+        if conversations.contains_key(peer) {
+            return Some(peer.to_string());
+        }
+        conversations
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(peer))
+            .cloned()
+    }
+
+    async fn load_or_get_ratchet(&self, peer: &str) -> Option<DoubleRatchet> {
+        {
+            let conversations = self.conversations.read().await;
+            if let Some(key) = Self::find_conversation_key(&conversations, peer).await {
+                if let Some(ratchet) = conversations.get(&key).and_then(|c| c.ratchet.clone()) {
+                    return Some(ratchet);
+                }
+            }
+        }
+
+        let path = self.session_file_path(peer)?;
+        let bytes = tokio::fs::read(&path).await.ok()?;
+        let ratchet = DoubleRatchet::from_bytes(&bytes).ok()?;
+
+        let mut conversations = self.conversations.write().await;
+        let key = Self::find_conversation_key(&conversations, peer)
+            .await
+            .unwrap_or_else(|| peer.to_string());
+        let conv = conversations.entry(key).or_insert(Conversation {
+            peer_address: peer.to_string(),
+            ratchet: None,
+            message_ids: Vec::new(),
+            statuses: HashMap::new(),
+            unread: 0,
+        });
+        conv.ratchet = Some(ratchet.clone());
+        Some(ratchet)
+    }
+
+    async fn save_ratchet(&self, peer: &str, ratchet: DoubleRatchet) {
+        if let Some(path) = self.session_file_path(peer) {
+            if let Ok(bytes) = ratchet.to_bytes() {
+                if let Some(parent) = path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+                let _ = tokio::fs::write(&path, bytes).await;
+            }
+        }
+
+        let mut conversations = self.conversations.write().await;
+        let key = Self::find_conversation_key(&conversations, peer)
+            .await
+            .unwrap_or_else(|| peer.to_string());
+        let conv = conversations.entry(key).or_insert(Conversation {
+            peer_address: peer.to_string(),
+            ratchet: None,
+            message_ids: Vec::new(),
+            statuses: HashMap::new(),
+            unread: 0,
+        });
+        conv.ratchet = Some(ratchet);
     }
 
     /// Background synchronization daemon.
     /// Also starts the relay polling daemon for real P2P message delivery.
     pub fn start_sync_daemon(self: Arc<Self>) {
-        // Start the TransportRouter (auto-selects Nym/Tor/Direct)
+        // Start the TransportRouter (auto-selects Iroh/Nym/Tor/Direct)
         let router = self.transport.clone();
         crate::ffi::runtime().spawn(async move {
             router.start().await;
         });
 
+        // Publish our verified EndpointId + X3DH PrekeyBundle once federated pools are ready.
+        let pub_client = self.clone();
+        crate::ffi::runtime().spawn(async move {
+            crate::network_bundle::ensure_federated_pools().await;
+            let _ = pub_client.publish_peer_bundle().await;
+        });
+
         // ── HTTP Relay polling loop ──────────────────────────────────────────
-        // Fetches store-and-forward messages from the Cloudflare relay every
-        // 15 seconds (the relay rate-limits more aggressive polling).
-        // This is the PRIMARY path for text message delivery.
         let transport_for_poll = self.transport.clone();
         crate::ffi::runtime().spawn(async move {
-            // Give the transport a moment to initialise before first poll
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             loop {
                 let sender = crate::transport::direct::DefaultSender {
                     direct: transport_for_poll.direct.clone(),
@@ -139,12 +307,15 @@ impl SwarmClient {
             }
         });
 
-        // Incoming message processing loop (200ms) — drains WebSocket + HTTP inboxes into Dart
+        // Incoming message processing loop — event-driven via Notify with 2s fallback sweep.
         let client = self.clone();
         crate::ffi::runtime().spawn(async move {
             loop {
                 client.process_incoming().await;
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                tokio::select! {
+                    _ = client.transport.incoming_notify.notified() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {}
+                }
             }
         });
 
@@ -173,24 +344,8 @@ impl SwarmClient {
 
 
     /// Create with custom transport config (e.g., specific bootstrap nodes).
-    pub fn with_config(identity: CipherIdentity, config: DirectTransportConfig) -> Self {
-        let (tx, _) = tokio::sync::broadcast::channel(1000);
-        let peer_id = identity.display_address();
-        let secret_bytes = identity.ed25519_secret_bytes();
-        let transport = TransportRouter::new_with_secret(peer_id, secret_bytes);
-
-        Self {
-            identity,
-            conversations: Arc::new(RwLock::new(HashMap::new())),
-            transport: Arc::new(transport),
-            sent_log: Arc::new(RwLock::new(HashMap::new())),
-            inbox: Arc::new(RwLock::new(Vec::new())),
-            media_tx: tx,
-            seen_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
-            peer_presence: Arc::new(RwLock::new(HashMap::new())),
-            presence_enabled: Arc::new(RwLock::new(true)),
-            chunk_buffer: Arc::new(RwLock::new(HashMap::new())),
-        }
+    pub fn with_config(identity: CipherIdentity, _config: DirectTransportConfig) -> Self {
+        Self::new(identity)
     }
 
     /// Get our EVM address (= chat ID).
@@ -199,39 +354,100 @@ impl SwarmClient {
     }
 
     /// Send a text message to a recipient.
+    /// Dual-path encryption:
+    /// - If a verified `SignedPeerBundle` exists (or an active `DoubleRatchet` exists),
+    ///   establishes X3DH + per-message Double Ratchet forward secrecy and caches the
+    ///   peer's Iroh `EndpointId` for direct QUIC P2P delivery.
+    /// - Otherwise falls back cleanly to `v0.2.3`-compatible symmetric key derivation.
     pub async fn send_text(&self, recipient: &str, plaintext: &str) -> Result<MessageId, CipherError> {
-        let conversations = self.conversations.read().await;
-        let has_ratchet = conversations
-            .get(recipient)
-            .and_then(|c| c.ratchet.as_ref())
-            .is_some();
-        drop(conversations);
+        let our_addr = self.our_address();
 
-        if !has_ratchet {
-            // No existing session — we need to do X3DH first
-            // For now, use a simple shared-key approach (will be X3DH with prekey bundles later)
-            debug!("No ratchet session with {} — creating new session", recipient);
+        // Populate peer's Iroh EndpointId when available (cheap cache hit after first lookup).
+        let needs_endpoint = is_valid_evm_address(recipient)
+            && self.transport.iroh.resolve_endpoint(recipient).await.is_err();
+        let resolved_bundle = if needs_endpoint {
+            self.ensure_peer_resolved(recipient).await
+        } else {
+            None
+        };
+
+        let mut ratchet_opt = self.load_or_get_ratchet(recipient).await;
+        let mut init_ke_bytes: Option<Vec<u8>> = None;
+
+        // Need a fresh X3DH handshake if no send-capable ratchet session exists yet.
+        if !ratchet_opt.as_ref().map(|r| r.can_send()).unwrap_or(false) {
+            let bundle_opt = match resolved_bundle {
+                Some(b) => Some(b),
+                None => self.ensure_peer_resolved(recipient).await,
+            };
+
+            if let Some(bundle) = bundle_opt {
+                let prekey = bundle.prekey_bundle();
+                let x3dh = x3dh_initiate(self.identity.x25519_secret_key(), &prekey)?;
+                let ratchet = DoubleRatchet::init_sender(
+                    x3dh.shared_secret,
+                    x25519_dalek::PublicKey::from(bundle.signed_prekey),
+                );
+                let header = X3dhHandshakeHeader {
+                    sender_identity_x25519: *self.identity.x25519_public_key().as_bytes(),
+                    ephemeral_public: x3dh.ephemeral_public,
+                    one_time_prekey: prekey.one_time_prekey,
+                };
+                let header_json = serde_json::to_vec(&header)
+                    .map_err(|e| CipherError::Encryption(format!("X3DH header encode: {e}")))?;
+                let temp_key = self.derive_temp_session_key(recipient);
+                let enc_header = aes_encrypt(&temp_key, &header_json)?;
+                let ke_msg = CipherMessage {
+                    id: uuid::Uuid::new_v4(),
+                    sender: our_addr.clone(),
+                    recipient: recipient.to_string(),
+                    msg_type: MessageType::KeyExchange,
+                    timestamp: chrono::Utc::now(),
+                    payload: enc_header.ciphertext,
+                    nonce: enc_header.nonce,
+                    dh_public: x3dh.ephemeral_public,
+                    counter: 0,
+                    ttl: 30 * 86400,
+                };
+                init_ke_bytes = Some(ke_msg.to_bytes());
+                ratchet_opt = Some(ratchet);
+                debug!("Initiated X3DH + Double Ratchet session with {}", recipient);
+            } else {
+                debug!("No peer bundle for {} — using v0.2.3 compatible fallback key", recipient);
+            }
         }
 
-        // Encrypt the message
-        // For now, use a derived session key (real: Double Ratchet)
-        let session_key = self.derive_temp_session_key(recipient);
-        let encrypted = aes_encrypt(&session_key, plaintext.as_bytes())?;
-
-        // Build CipherMessage envelope
-        let our_addr = self.our_address();
-        let msg = CipherMessage::new_text(
-            &our_addr,
-            recipient,
-            encrypted.ciphertext,
-            encrypted.nonce,
-            [0u8; 32], // DH public (populated by ratchet in production)
-            0,
-        );
+        let msg = if let Some(mut ratchet) = ratchet_opt.filter(|r| r.can_send()) {
+            let rmsg = ratchet.encrypt(plaintext.as_bytes())?;
+            self.save_ratchet(recipient, ratchet).await;
+            CipherMessage::new_text(
+                &our_addr,
+                recipient,
+                rmsg.encrypted.ciphertext,
+                rmsg.encrypted.nonce,
+                rmsg.dh_public,
+                rmsg.counter,
+            )
+        } else {
+            let session_key = self.derive_temp_session_key(recipient);
+            let encrypted = aes_encrypt(&session_key, plaintext.as_bytes())?;
+            CipherMessage::new_text(
+                &our_addr,
+                recipient,
+                encrypted.ciphertext,
+                encrypted.nonce,
+                [0u8; 32],
+                0,
+            )
+        };
 
         let msg_id = msg.id;
 
-        // Serialize and queue for delivery via HTTP relay
+        if let Some(ke_bytes) = init_ke_bytes {
+            self.transport.queue_message(recipient, ke_bytes).await?;
+        }
+
+        // Serialize and queue for delivery via active transport (Iroh/Tor/Nym/Direct)
         let data = msg.to_bytes();
         self.transport.queue_message(recipient, data).await?;
 
@@ -240,7 +456,10 @@ impl SwarmClient {
 
         // Track in conversation
         let mut conversations = self.conversations.write().await;
-        let conv = conversations.entry(recipient.to_string()).or_insert(Conversation {
+        let key = Self::find_conversation_key(&conversations, recipient)
+            .await
+            .unwrap_or_else(|| recipient.to_string());
+        let conv = conversations.entry(key).or_insert(Conversation {
             peer_address: recipient.to_string(),
             ratchet: None,
             message_ids: Vec::new(),
@@ -252,7 +471,7 @@ impl SwarmClient {
 
         info!("Message {} queued for {}", msg_id, recipient);
 
-        // Immediate flush (~100ms path when relay + WS push are up)
+        // Immediate flush (~100ms path when relay + WS push are up; no-op if sent via Iroh/Tor)
         let _ = self
             .transport
             .direct
@@ -445,65 +664,186 @@ impl SwarmClient {
         Ok(msg_id)
     }
 
+    /// Whether there are unread messages buffered in the local inbox.
+    pub async fn has_pending_inbox(&self) -> bool {
+        !self.inbox.read().await.is_empty()
+    }
+
+    async fn record_seen_id(&self, msg_id: MessageId) {
+        let mut seen = self.seen_ids.write().await;
+        seen.insert(msg_id);
+        if seen.len() > 500 {
+            let to_remove: Vec<_> = seen.iter().take(250).cloned().collect();
+            for id in to_remove {
+                seen.remove(&id);
+            }
+        }
+    }
+
     /// Background loop: Receive and process all pending messages autonomously
     pub async fn process_incoming(&self) {
         let raw_messages = self.transport.drain_unread().await;
+        if raw_messages.is_empty() {
+            return;
+        }
 
+        let mut decoded = Vec::with_capacity(raw_messages.len());
         for data in raw_messages {
             match CipherMessage::from_bytes(&data) {
-                Ok(mut msg) => {
-                    let sender = msg.sender.clone();
-                    let msg_id = msg.id;
+                Ok(msg) => decoded.push(msg),
+                Err(e) => {
+                    log::warn!("Failed to decode message envelope: {}", e);
+                }
+            }
+        }
 
-                    // Dedup: skip if we've already processed this message
-                    // (can arrive twice via WebSocket + HTTP dual delivery)
-                    {
-                        let mut seen = self.seen_ids.write().await;
-                        if seen.contains(&msg_id) {
-                            continue;
-                        }
-                        seen.insert(msg_id);
-                        // Prune seen set if it gets too large (keep last 500)
-                        if seen.len() > 500 {
-                            let to_remove: Vec<_> = seen.iter().take(250).cloned().collect();
-                            for id in to_remove { seen.remove(&id); }
-                        }
-                    }
+        // Process X3DH KeyExchange before data frames, and order chains deterministically.
+        decoded.sort_by_key(|m| (
+            !matches!(m.msg_type, MessageType::KeyExchange),
+            m.timestamp,
+            m.counter,
+        ));
 
-                    // Decrypt payload immediately
-                    let session_key = self.derive_temp_session_key(&sender);
-                    use crate::encryption::{aes_decrypt, EncryptedMessage};
-                    let encrypted_msg = EncryptedMessage {
+        let mut queue: VecDeque<CipherMessage> = VecDeque::from(decoded);
+        let mut added_to_inbox = false;
+
+        while let Some(mut msg) = queue.pop_front() {
+            let sender = msg.sender.clone();
+            let msg_id = msg.id;
+
+            // Dedup: skip if we've already processed this message
+            // (can arrive twice via WebSocket + HTTP dual delivery)
+            if self.seen_ids.read().await.contains(&msg_id) {
+                continue;
+            }
+
+            // 1. Handle X3DH KeyExchange initialization
+            if matches!(msg.msg_type, MessageType::KeyExchange) {
+                let header_bytes = if msg.nonce == [0u8; 12] {
+                    msg.payload.clone()
+                } else {
+                    let temp_key = self.derive_temp_session_key(&sender);
+                    let enc = EncryptedMessage {
                         ciphertext: msg.payload.clone(),
                         nonce: msg.nonce,
                     };
-                    
-                    match aes_decrypt(&session_key, &encrypted_msg) {
-                        Ok(plaintext) => {
-                            // If this is a naked UDP payload, intercept it out of the UI pipeline!
-                            if msg.msg_type == crate::message::MessageType::CallMedia {
-                                let _ = self.media_tx.send(plaintext);
-                                continue; 
+                    match aes_decrypt(&temp_key, &enc) {
+                        Ok(pt) => pt,
+                        Err(_) => msg.payload.clone(),
+                    }
+                };
+
+                match serde_json::from_slice::<X3dhHandshakeHeader>(&header_bytes) {
+                    Ok(header) => {
+                        match x3dh_respond(
+                            self.identity.x25519_secret_key(),
+                            &self.signed_prekey,
+                            None,
+                            &header.sender_identity_x25519,
+                            &header.ephemeral_public,
+                        ) {
+                            Ok(shared_secret) => {
+                                let ratchet = DoubleRatchet::init_receiver(
+                                    shared_secret,
+                                    self.signed_prekey.clone(),
+                                );
+                                self.save_ratchet(&sender, ratchet).await;
+                                self.record_seen_id(msg_id).await;
+                                debug!("Established X3DH + Double Ratchet session with {}", sender);
+
+                                // Replay any buffered messages from this sender in order.
+                                let sender_key = sender.to_lowercase();
+                                let mut pending = self.pending_ratchet.write().await.remove(&sender_key).unwrap_or_default();
+                                pending.sort_by_key(|m| (m.timestamp, m.counter));
+                                for buffered in pending.into_iter().rev() {
+                                    queue.push_front(buffered);
+                                }
                             }
-                            
-                            // Otherwise, unwrap the decrypted JSON back into the public wrapper
-                            msg.payload = plaintext;
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to decrypt message {} from {}: {}", msg_id, sender, e);
-                            continue;
+                            Err(e) => {
+                                self.record_seen_id(msg_id).await;
+                                log::warn!("X3DH handshake failed from {}: {}", sender, e);
+                            }
                         }
                     }
+                    Err(e) => {
+                        self.record_seen_id(msg_id).await;
+                        log::warn!("Invalid X3DH KeyExchange header from {}: {}", sender, e);
+                    }
+                }
+                continue;
+            }
 
-                    // Track in conversations for UI notifications
-                    let mut conversations = self.conversations.write().await;
-                    let conv = conversations.entry(sender.clone()).or_insert(Conversation {
-                        peer_address: sender.clone(),
-                        ratchet: None,
-                        message_ids: Vec::new(),
-                        statuses: HashMap::new(),
-                        unread: 0,
-                    });
+            // 2. Decrypt payload (Double Ratchet when `dh_public != [0;32]`, else v0.2.3 fallback)
+            if msg.dh_public != [0u8; 32] {
+                let Some(mut ratchet) = self.load_or_get_ratchet(&sender).await else {
+                    // Handshake envelope may arrive in a later poll; buffer temporarily.
+                    let sender_key = sender.to_lowercase();
+                    let mut pending = self.pending_ratchet.write().await;
+                    let list = pending.entry(sender_key).or_default();
+                    if list.len() < 64 && !list.iter().any(|m| m.id == msg_id) {
+                        list.push(msg);
+                    }
+                    continue;
+                };
+
+                let rmsg = RatchetMessage {
+                    dh_public: msg.dh_public,
+                    counter: msg.counter,
+                    encrypted: EncryptedMessage {
+                        ciphertext: msg.payload.clone(),
+                        nonce: msg.nonce,
+                    },
+                };
+                match ratchet.decrypt(&rmsg) {
+                    Ok(plaintext) => {
+                        self.save_ratchet(&sender, ratchet).await;
+                        self.record_seen_id(msg_id).await;
+                        if msg.msg_type == crate::message::MessageType::CallMedia {
+                            let _ = self.media_tx.send(plaintext);
+                            continue;
+                        }
+                        msg.payload = plaintext;
+                    }
+                    Err(e) => {
+                        self.record_seen_id(msg_id).await;
+                        log::warn!("Ratchet decrypt failed for {} from {}: {}", msg_id, sender, e);
+                        continue;
+                    }
+                }
+            } else {
+                self.record_seen_id(msg_id).await;
+                let session_key = self.derive_temp_session_key(&sender);
+                let encrypted_msg = EncryptedMessage {
+                    ciphertext: msg.payload.clone(),
+                    nonce: msg.nonce,
+                };
+                match aes_decrypt(&session_key, &encrypted_msg) {
+                    Ok(plaintext) => {
+                        if msg.msg_type == crate::message::MessageType::CallMedia {
+                            let _ = self.media_tx.send(plaintext);
+                            continue;
+                        }
+                        msg.payload = plaintext;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to decrypt message {} from {}: {}", msg_id, sender, e);
+                        continue;
+                    }
+                }
+            }
+
+            // Track in conversations for UI notifications
+            let mut conversations = self.conversations.write().await;
+            let conv_key = Self::find_conversation_key(&conversations, &sender)
+                .await
+                .unwrap_or_else(|| sender.clone());
+            let conv = conversations.entry(conv_key).or_insert(Conversation {
+                peer_address: sender.clone(),
+                ratchet: None,
+                message_ids: Vec::new(),
+                statuses: HashMap::new(),
+                unread: 0,
+            });
 
                     // Handle receipts: update delivery status on our sent messages
                     match &msg.msg_type {
@@ -586,6 +926,7 @@ impl SwarmClient {
                                     drop(conversations);
                                     let _ = self.send_receipt(&assembled_sender, h.id, ReceiptType::Delivered).await;
                                     self.inbox.write().await.push(h);
+                                    added_to_inbox = true;
                                 } else {
                                     // No header yet — create synthetic file message
                                     let file_msg = CipherMessage {
@@ -611,6 +952,7 @@ impl SwarmClient {
                                     conv.unread += 1;
                                     drop(conversations);
                                     self.inbox.write().await.push(file_msg);
+                                    added_to_inbox = true;
                                 }
                             } else {
                                 drop(buf);
@@ -651,6 +993,7 @@ impl SwarmClient {
                                             drop(conversations);
                                             let _ = self.send_receipt(&sender, h.id, ReceiptType::Delivered).await;
                                             self.inbox.write().await.push(h);
+                                            added_to_inbox = true;
                                         } else {
                                             drop(buf);
                                             drop(conversations);
@@ -676,13 +1019,13 @@ impl SwarmClient {
                         }
                     }
 
-                    // Append to unread inbox for Dart to poll!
+                    // Append to unread inbox for CLI / Dart FFI!
                     self.inbox.write().await.push(msg);
-                }
-                Err(e) => {
-                    log::warn!("Failed to decode message envelope: {}", e);
-                }
-            }
+                    added_to_inbox = true;
+        }
+
+        if added_to_inbox {
+            self.inbox_notify.notify_waiters();
         }
     }
 
@@ -933,5 +1276,164 @@ mod tests {
 
         let convos = client.conversation_list().await;
         assert_eq!(convos.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_dual_path_x3dh_and_bidirectional_double_ratchet() {
+        let offline_bundle = crate::network_bundle::NetworkBundle::fallback();
+        let empty_relay = RelayPool::from_bundle(&offline_bundle);
+        let empty_signal = Arc::new(SignalPool::new_from_bundle(&offline_bundle));
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let alice_dir = std::env::temp_dir().join(format!("cipher-ratchet-alice-{ts}"));
+        let bob_dir = std::env::temp_dir().join(format!("cipher-ratchet-bob-{ts}"));
+
+        let alice_id = CipherIdentity::generate().unwrap();
+        let bob_id = CipherIdentity::generate().unwrap();
+        let alice_addr = alice_id.display_address();
+        let bob_addr = bob_id.display_address();
+
+        let alice = SwarmClient::with_mode_and_pools(
+            alice_id.clone(),
+            TransportMode::Direct,
+            empty_relay.clone(),
+            empty_signal.clone(),
+        )
+        .with_session_dir(alice_dir.clone());
+        let bob = SwarmClient::with_mode_and_pools(
+            bob_id.clone(),
+            TransportMode::Direct,
+            empty_relay.clone(),
+            empty_signal.clone(),
+        )
+        .with_session_dir(bob_dir.clone());
+
+        let alice_bundle = SignedPeerBundle::from_identity(&alice.identity).unwrap();
+        let bob_bundle = SignedPeerBundle::from_identity(&bob.identity).unwrap();
+        alice.peer_directory.insert_verified(bob_bundle.clone()).await.unwrap();
+        bob.peer_directory.insert_verified(alice_bundle.clone()).await.unwrap();
+
+        alice.send_text(&bob_addr, "hello bob 1").await.unwrap();
+        alice.send_text(&bob_addr, "hello bob 2").await.unwrap();
+
+        let outbound = alice.transport.direct.get_pending(&bob_addr).await;
+        // KeyExchange + 2 encrypted text envelopes
+        assert_eq!(outbound.len(), 3);
+        let first_env = CipherMessage::from_bytes(&outbound[0]).unwrap();
+        assert_eq!(first_env.msg_type, MessageType::KeyExchange);
+        let second_env = CipherMessage::from_bytes(&outbound[1]).unwrap();
+        assert_ne!(second_env.dh_public, [0u8; 32]);
+
+        // Deliver text frames BEFORE KeyExchange to exercise buffering + replay ordering.
+        bob.transport.direct.push_received(outbound[2].clone()).await;
+        bob.transport.direct.push_received(outbound[1].clone()).await;
+        bob.process_incoming().await;
+        assert!(bob.receive_all().await.is_empty());
+
+        bob.transport.direct.push_received(outbound[0].clone()).await;
+        bob.process_incoming().await;
+        let bob_msgs = bob.receive_all().await;
+        assert_eq!(bob_msgs.len(), 2);
+        assert_eq!(String::from_utf8_lossy(&bob_msgs[0].payload), "hello bob 1");
+        assert_eq!(String::from_utf8_lossy(&bob_msgs[1].payload), "hello bob 2");
+
+        // Bob replies via Double Ratchet DH ratchet step back to Alice
+        // (two Delivery receipts were also auto-queued when Bob processed Alice's 2 texts).
+        let msg1_id = alice.conversations.read().await.get(&bob_addr).unwrap().message_ids[0];
+        let msg2_id = alice.conversations.read().await.get(&bob_addr).unwrap().message_ids[1];
+        bob.send_text(&alice_addr, "hi alice").await.unwrap();
+        let replies = bob.transport.direct.get_pending(&alice_addr).await;
+        assert_eq!(replies.len(), 3);
+        let reply_env = CipherMessage::from_bytes(&replies[2]).unwrap();
+        assert_ne!(reply_env.dh_public, [0u8; 32]);
+
+        for frame in &replies {
+            alice.transport.direct.push_received(frame.clone()).await;
+        }
+        alice.process_incoming().await;
+        let alice_msgs = alice.receive_all().await;
+        assert_eq!(alice_msgs.len(), 1);
+        assert_eq!(String::from_utf8_lossy(&alice_msgs[0].payload), "hi alice");
+        assert_eq!(alice.delivery_status(&msg1_id).await, Some(DeliveryStatus::Delivered));
+        assert_eq!(alice.delivery_status(&msg2_id).await, Some(DeliveryStatus::Delivered));
+
+        // Simulate new short-lived CLI process reloading Alice's ratchet from disk.
+        let alice_restarted = SwarmClient::with_mode_and_pools(
+            alice_id,
+            TransportMode::Direct,
+            empty_relay,
+            empty_signal,
+        )
+        .with_session_dir(alice_dir.clone());
+        alice_restarted.send_text(&bob_addr, "persisted ratchet").await.unwrap();
+        let next_outbound = alice_restarted.transport.direct.get_pending(&bob_addr).await;
+        assert_eq!(next_outbound.len(), 1); // No repeat KeyExchange needed
+        bob.transport.direct.push_received(next_outbound[0].clone()).await;
+        bob.process_incoming().await;
+        let bob_next = bob.receive_all().await;
+        assert_eq!(bob_next.len(), 1);
+        assert_eq!(String::from_utf8_lossy(&bob_next[0].payload), "persisted ratchet");
+
+        let _ = std::fs::remove_dir_all(alice_dir);
+        let _ = std::fs::remove_dir_all(bob_dir);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_v023_fallback_compatibility() {
+        let offline_bundle = crate::network_bundle::NetworkBundle::fallback();
+        let empty_relay = RelayPool::from_bundle(&offline_bundle);
+        let empty_signal = Arc::new(SignalPool::new_from_bundle(&offline_bundle));
+
+        let alice = SwarmClient::with_mode_and_pools(
+            CipherIdentity::generate().unwrap(),
+            TransportMode::Direct,
+            empty_relay.clone(),
+            empty_signal.clone(),
+        );
+        let legacy_bob = SwarmClient::with_mode_and_pools(
+            CipherIdentity::generate().unwrap(),
+            TransportMode::Direct,
+            empty_relay,
+            empty_signal,
+        );
+        let bob_addr = legacy_bob.our_address();
+
+        // No SignedPeerBundle published -> must fall back to dh_public == [0;32] v0.2.3 envelope.
+        alice.send_text(&bob_addr, "legacy v0.2.3 hello").await.unwrap();
+        let queued = alice.transport.direct.get_pending(&bob_addr).await;
+        assert_eq!(queued.len(), 1);
+        let env = CipherMessage::from_bytes(&queued[0]).unwrap();
+        assert_eq!(env.dh_public, [0u8; 32]);
+
+        legacy_bob.transport.direct.push_received(queued[0].clone()).await;
+        legacy_bob.process_incoming().await;
+        let msgs = legacy_bob.receive_all().await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(String::from_utf8_lossy(&msgs[0].payload), "legacy v0.2.3 hello");
+    }
+
+    #[tokio::test]
+    async fn test_peer_directory_registers_iroh_endpoint_for_auto_mode() {
+        let offline_bundle = crate::network_bundle::NetworkBundle::fallback();
+        let alice = SwarmClient::with_mode_and_pools(
+            CipherIdentity::generate().unwrap(),
+            TransportMode::Auto,
+            RelayPool::from_bundle(&offline_bundle),
+            Arc::new(SignalPool::new_from_bundle(&offline_bundle)),
+        );
+        let bob_id = CipherIdentity::generate().unwrap();
+        let bob_addr = bob_id.display_address();
+        let bob_bundle = SignedPeerBundle::from_identity(&bob_id).unwrap();
+        let expected_eid = bob_bundle.iroh_endpoint_id().unwrap();
+
+        alice.peer_directory.insert_verified(bob_bundle).await.unwrap();
+        let resolved = alice.ensure_peer_resolved(&bob_addr).await;
+        assert!(resolved.is_some());
+
+        let registered_eid = alice.transport.iroh.resolve_endpoint(&bob_addr).await.unwrap();
+        assert_eq!(registered_eid, expected_eid);
     }
 }

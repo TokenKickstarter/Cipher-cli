@@ -4,7 +4,6 @@ use colored::Colorize;
 use std::sync::Arc;
 use std::io::{self, BufRead, Write};
 use client_core::message::MessageType;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run(peer: &str) -> Result<(), String> {
@@ -35,7 +34,7 @@ pub async fn run(peer: &str) -> Result<(), String> {
     println!("  └─────────────────────────────────────────────┘");
     println!();
 
-    let client = Arc::new(SwarmClient::new(identity));
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
     super::network::print_connect_status(&client).await;
@@ -105,7 +104,12 @@ pub async fn run(peer: &str) -> Result<(), String> {
                 }
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            if !client_recv.has_pending_inbox().await {
+                tokio::select! {
+                    _ = client_recv.inbox_notify.notified() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {}
+                }
+            }
         }
     });
 

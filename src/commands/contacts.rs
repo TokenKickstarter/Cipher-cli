@@ -2,20 +2,19 @@
 
 use colored::Colorize;
 use std::sync::Arc;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run() -> Result<(), String> {
     let identity = identity_store::get_identity()?;
 
-    let client = Arc::new(SwarmClient::new(identity));
-    let client_clone = client.clone();
-    client_clone.start_sync_daemon();
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
+    client_core::network_bundle::ensure_federated_pools().await;
 
-    // Wait for sync
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-    // Process any pending incoming messages to discover peers
+    // Poll relay once directly instead of fixed sleep, then decode incoming peers.
+    let poll_sender = client_core::transport::direct::DefaultSender {
+        direct: client.transport.direct.clone(),
+    };
+    client.transport.direct.poll_incoming(&poll_sender).await;
     client.process_incoming().await;
 
     let contacts = client.conversation_list().await;

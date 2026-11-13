@@ -22,7 +22,7 @@ use crate::error::CipherError;
 use crate::network_bundle::{NetworkBundle, RelayPool, SignalPool};
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use log::{info, warn, debug};
 
 /// Transport-agnostic interface for sending/receiving bytes.
@@ -62,6 +62,31 @@ pub enum TransportMode {
     DomainFronting,
 }
 
+impl TransportMode {
+    /// Parse persisted or CLI transport mode string (defaults to `Direct` for unknown values).
+    pub fn from_config_str(raw: &str) -> Self {
+        match raw.trim().to_lowercase().as_str() {
+            "auto" => Self::Auto,
+            "iroh" => Self::Iroh,
+            "tor" => Self::Tor,
+            "nym" => Self::Nym,
+            "front" | "domain-fronting" | "domain_fronting" => Self::DomainFronting,
+            _ => Self::Direct,
+        }
+    }
+
+    pub fn config_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Iroh => "iroh",
+            Self::Direct => "direct",
+            Self::Tor => "tor",
+            Self::Nym => "nym",
+            Self::DomainFronting => "domain-fronting",
+        }
+    }
+}
+
 impl std::fmt::Display for TransportMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -73,6 +98,32 @@ impl std::fmt::Display for TransportMode {
             Self::DomainFronting => write!(f, "Domain Fronting (censorship resistance)"),
         }
     }
+}
+
+/// Resolve persisted transport mode from `CIPHER_TRANSPORT_MODE` or `$CIPHER_DIR/config.json` / `~/.cipher/config.json`.
+pub fn load_persisted_mode() -> TransportMode {
+    if let Ok(env_mode) = std::env::var("CIPHER_TRANSPORT_MODE") {
+        if !env_mode.trim().is_empty() {
+            return TransportMode::from_config_str(&env_mode);
+        }
+    }
+    let dir = std::env::var_os("CIPHER_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| std::path::PathBuf::from(h).join(".cipher"))
+        });
+    if let Some(cfg_path) = dir.map(|d| d.join("config.json")) {
+        if let Ok(text) = std::fs::read_to_string(&cfg_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(m) = v.get("transport_mode").and_then(|s| s.as_str()) {
+                    return TransportMode::from_config_str(m);
+                }
+            }
+        }
+    }
+    TransportMode::Direct
 }
 
 /// Routes messages through the appropriate privacy transport.
@@ -94,6 +145,8 @@ pub struct TransportRouter {
     pub domain_front: Arc<domain_front::DomainFrontTransport>,
     /// Real-time WebSocket signal channel (for instant call signaling)
     pub ws_signal: Arc<websocket_signal::WebSocketSignal>,
+    /// Unified notifier woken whenever Direct, WebSocket, or Iroh receives incoming bytes
+    pub incoming_notify: Arc<Notify>,
     /// Our EVM address
     peer_id: String,
 }
@@ -108,19 +161,42 @@ impl TransportRouter {
         Self::new_with_secret(peer_id, key)
     }
 
-    /// Create a new transport router with an explicit Ed25519 secret key for Iroh.
+    /// Create a new transport router honoring the persisted CLI/config mode.
     pub fn new_with_secret(peer_id: String, secret_key: [u8; 32]) -> Self {
-        let relay_pool = RelayPool::global();
-        let signal_pool = SignalPool::global();
+        Self::new_with_mode(peer_id, secret_key, load_persisted_mode())
+    }
 
-        let direct = Arc::new(direct::DirectTransport::new(
+    /// Create a new transport router with explicit Ed25519 secret key and transport mode.
+    pub fn new_with_mode(peer_id: String, secret_key: [u8; 32], initial_mode: TransportMode) -> Self {
+        Self::new_with_mode_and_pools(
+            peer_id,
+            secret_key,
+            initial_mode,
+            RelayPool::global(),
+            SignalPool::global(),
+        )
+    }
+
+    /// Create a transport router with explicit pools (useful for isolated tests or local relays).
+    pub fn new_with_mode_and_pools(
+        peer_id: String,
+        secret_key: [u8; 32],
+        initial_mode: TransportMode,
+        relay_pool: Arc<RelayPool>,
+        signal_pool: Arc<SignalPool>,
+    ) -> Self {
+        let incoming_notify = Arc::new(Notify::new());
+
+        let direct = Arc::new(direct::DirectTransport::new_with_notify(
             peer_id.clone(),
             direct::DirectTransportConfig::default(),
             relay_pool.clone(),
+            incoming_notify.clone(),
         ));
-        let iroh = Arc::new(iroh_p2p::IrohTransport::new(
+        let iroh = Arc::new(iroh_p2p::IrohTransport::new_with_notify(
             peer_id.clone(),
             secret_key,
+            incoming_notify.clone(),
         ));
         let tor = Arc::new(tor::TorTransport::new(
             peer_id.clone(),
@@ -131,20 +207,22 @@ impl TransportRouter {
             nym::NymConfig::default(),
         ));
         let domain_front = Arc::new(domain_front::DomainFrontTransport::new());
-        let ws_signal = Arc::new(websocket_signal::WebSocketSignal::new(
+        let ws_signal = Arc::new(websocket_signal::WebSocketSignal::new_with_notify(
             peer_id.clone(),
             signal_pool,
             relay_pool.clone(),
+            incoming_notify.clone(),
         ));
 
         Self {
-            mode: Arc::new(RwLock::new(TransportMode::Direct)),
+            mode: Arc::new(RwLock::new(initial_mode)),
             direct,
             iroh,
             tor,
             nym,
             domain_front,
             ws_signal,
+            incoming_notify,
             peer_id,
         }
     }
@@ -172,15 +250,13 @@ impl TransportRouter {
         // Try to bootstrap privacy / P2P layers
         match mode {
             TransportMode::Auto => {
-                // Try Iroh P2P first, then Nym, Tor, fall back to Direct
+                // Prefer direct Iroh QUIC P2P; probe Tor SOCKS5 only if locally running, fallback Direct.
                 if let Ok(node_id) = self.iroh.init().await {
                     info!("[Router] Auto: Iroh P2P active with NodeId: {}", node_id);
-                } else if self.nym.connect().await.is_ok() {
-                    info!("[Router] Auto: Using Nym mixnet");
                 } else if self.tor.bootstrap().await.is_ok() {
-                    info!("[Router] Auto: Using Tor (Nym unavailable)");
+                    info!("[Router] Auto: Using Tor fallback");
                 } else {
-                    info!("[Router] Auto: Using Direct (Iroh + Tor + Nym unavailable)");
+                    info!("[Router] Auto: Using Direct relay store-and-forward + WS push");
                 }
             }
             TransportMode::Iroh => {
@@ -222,6 +298,15 @@ impl TransportRouter {
     pub async fn active_transport_name(&self) -> &'static str {
         let mode = self.mode.read().await.clone();
         match mode {
+            TransportMode::Auto => {
+                if self.iroh.is_ready().await {
+                    "Auto (Iroh P2P + Relay Fallback)"
+                } else if self.tor.tor_state().await == tor::TorState::Connected {
+                    "Auto (Tor)"
+                } else {
+                    "Auto (Direct Relay + WS)"
+                }
+            }
             TransportMode::Iroh => "Iroh (QUIC + Magicsock P2P)",
             TransportMode::Nym => {
                 if self.nym.nym_state().await != nym::NymState::Disabled {
@@ -244,7 +329,7 @@ impl TransportRouter {
                     "Direct (Domain Front fallback)"
                 }
             }
-            _ => "Direct",
+            TransportMode::Direct => "Direct",
         }
     }
 
@@ -252,7 +337,23 @@ impl TransportRouter {
     pub async fn queue_message(&self, recipient: &str, data: Vec<u8>) -> Result<(), CipherError> {
         let mode = self.mode.read().await.clone();
         match mode {
+            TransportMode::Auto => {
+                if self.iroh.is_ready().await && self.iroh.resolve_endpoint(recipient).await.is_ok() {
+                    if let Err(e) = self.iroh.send_to_node(recipient, &data).await {
+                        debug!("[Router] Auto Iroh QUIC send failed ({e}) — falling back cleanly");
+                    } else {
+                        return Ok(());
+                    }
+                }
+                if self.tor.tor_state().await == tor::TorState::Connected {
+                    return self.tor.queue_message(recipient, data).await;
+                }
+                self.direct.queue_message(recipient, data).await
+            }
             TransportMode::Iroh => {
+                if !self.iroh.is_ready().await {
+                    let _ = self.iroh.init().await;
+                }
                 if let Err(e) = self.iroh.send_to_node(recipient, &data).await {
                     debug!("[Router] Direct Iroh QUIC send failed: {e} — falling back to relay store-and-forward");
                     self.direct.queue_message(recipient, data).await
@@ -281,7 +382,7 @@ impl TransportRouter {
                     self.direct.queue_message(recipient, data).await
                 }
             }
-            _ => self.direct.queue_message(recipient, data).await,
+            TransportMode::Direct => self.direct.queue_message(recipient, data).await,
         }
     }
 
@@ -296,18 +397,21 @@ impl TransportRouter {
         all
     }
 
-    /// Send via multiple paths: federated HTTP relays, Iroh QUIC, WebSocket signal.
+    /// Send via multiple paths: federated HTTP relays, Iroh QUIC (when active), WebSocket signal.
     pub async fn send_signal(&self, recipient: &str, data: Vec<u8>) -> Result<(), CipherError> {
         self.queue_message(recipient, data.clone()).await?;
         // Instantly force flush the outbox using fallback (instead of full trait system)
-        self.direct
+        let _ = self
+            .direct
             .flush_outbox(&crate::transport::direct::DefaultSender {
                 direct: self.direct.clone(),
             })
-            .await?;
+            .await;
 
-        // Try direct Iroh QUIC P2P delivery
-        let _ = self.iroh.send_to_node(recipient, &data).await;
+        // Try direct Iroh QUIC P2P delivery when active & peer EndpointId is known
+        if self.iroh.is_ready().await && self.iroh.resolve_endpoint(recipient).await.is_ok() {
+            let _ = self.iroh.send_to_node(recipient, &data).await;
+        }
 
         // ALSO try WebSocket for instant delivery (best-effort, don't fail if it errors)
         if let Err(e) = self.ws_signal.send_signal(recipient, data).await {

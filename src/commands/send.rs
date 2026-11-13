@@ -2,7 +2,6 @@
 
 use colored::Colorize;
 use std::sync::Arc;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
@@ -21,14 +20,11 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
     println!("  {} Sending as {}...", "↑".dimmed(), our_addr[..10].to_string().dimmed());
 
     // Create SwarmClient with the identity
-    let client = Arc::new(SwarmClient::new(identity));
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
 
     client_core::network_bundle::ensure_federated_pools().await;
-
-    // Give transport a moment to connect
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Send the message
     let msg_id = client
@@ -36,7 +32,7 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
-    // Force flush outbox to relay before exit
+    // Force flush outbox immediately so no background sleep is needed.
     let sender = client_core::transport::direct::DefaultSender {
         direct: client.transport.direct.clone(),
     };
@@ -46,7 +42,6 @@ pub async fn run(recipient: &str, message: &str) -> Result<(), String> {
         .flush_outbox(&sender)
         .await
         .map_err(|e| format!("Relay store failed: {e}"))?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     println!();
     println!("  {} Message sent!", "✓".green().bold());

@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::io::{self, BufRead, Write};
 use client_core::message::MessageType;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 /// Known contacts cache: address → username (if resolved)
@@ -47,7 +46,7 @@ pub async fn run() -> Result<(), String> {
     println!("  └─────────────────────────────────────────────────────┘");
     println!();
 
-    let client = Arc::new(SwarmClient::new(identity));
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
     crate::commands::network::print_connect_status(&client).await;
@@ -156,7 +155,12 @@ pub async fn run() -> Result<(), String> {
                 }
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            if !client_recv.has_pending_inbox().await {
+                tokio::select! {
+                    _ = client_recv.inbox_notify.notified() => {}
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {}
+                }
+            }
         }
     });
 

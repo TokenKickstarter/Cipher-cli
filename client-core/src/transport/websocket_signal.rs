@@ -10,7 +10,7 @@ use crate::error::CipherError;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 
 /// Legacy export — federated clients use [`crate::network_bundle::SignalPool`] instead.
 pub const DEFAULT_SIGNAL_WS_URL: &str = "";
@@ -62,13 +62,27 @@ pub struct WebSocketSignal {
     outgoing_tx: mpsc::Sender<String>,
     incoming_tx: mpsc::Sender<Vec<u8>>,
     incoming_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
+    incoming_notify: Arc<Notify>,
 }
 
 impl WebSocketSignal {
+    pub fn incoming_notify(&self) -> &Arc<Notify> {
+        &self.incoming_notify
+    }
+
     pub fn new(
         our_address: String,
         signal_pool: Arc<crate::network_bundle::SignalPool>,
         relay_pool: Arc<crate::network_bundle::RelayPool>,
+    ) -> Self {
+        Self::new_with_notify(our_address, signal_pool, relay_pool, Arc::new(Notify::new()))
+    }
+
+    pub fn new_with_notify(
+        our_address: String,
+        signal_pool: Arc<crate::network_bundle::SignalPool>,
+        relay_pool: Arc<crate::network_bundle::RelayPool>,
+        incoming_notify: Arc<Notify>,
     ) -> Self {
         let (outgoing_tx, outgoing_rx) = mpsc::channel(500);
         let (incoming_tx, incoming_rx) = mpsc::channel(500);
@@ -84,6 +98,7 @@ impl WebSocketSignal {
             outgoing_tx,
             incoming_tx,
             incoming_rx: Arc::new(tokio::sync::Mutex::new(incoming_rx)),
+            incoming_notify: incoming_notify.clone(),
         };
 
         let state = ws.state.clone();
@@ -102,6 +117,7 @@ impl WebSocketSignal {
                 relay_pool_spawn,
                 ws_index,
                 tx,
+                incoming_notify,
                 outgoing_rx,
             )
             .await;
@@ -117,6 +133,7 @@ impl WebSocketSignal {
         relay_pool: Arc<crate::network_bundle::RelayPool>,
         ws_index: Arc<RwLock<usize>>,
         incoming_tx: mpsc::Sender<Vec<u8>>,
+        incoming_notify: Arc<Notify>,
         outgoing_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<String>>>,
     ) {
         use futures_util::{SinkExt, StreamExt};
@@ -216,6 +233,7 @@ impl WebSocketSignal {
                                                     Ok(bytes) => {
                                                         info!("[WS] ⚡ Instant message via WebSocket push");
                                                         let _ = incoming_tx.send(bytes).await;
+                                                        incoming_notify.notify_waiters();
                                                         crate::ffi::notify_dart();
 
                                                         if let Some(mid) = json
@@ -248,6 +266,7 @@ impl WebSocketSignal {
                                                 match base64_decode(payload) {
                                                     Ok(bytes) => {
                                                         let _ = incoming_tx.send(bytes).await;
+                                                        incoming_notify.notify_waiters();
                                                         crate::ffi::notify_dart();
                                                     }
                                                     Err(e) => {
@@ -272,6 +291,7 @@ impl WebSocketSignal {
                                                 match base64_decode(&incoming.payload) {
                                                     Ok(bytes) => {
                                                         let _ = incoming_tx.send(bytes).await;
+                                                        incoming_notify.notify_waiters();
                                                         crate::ffi::notify_dart();
                                                     }
                                                     Err(e) => {

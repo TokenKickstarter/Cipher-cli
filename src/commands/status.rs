@@ -1,7 +1,6 @@
 //! `cipher-cli status` — identity, transport, and federated network snapshot.
 
 use client_core::network_bundle::{NetworkBundle, RelayPool};
-use client_core::swarm_client::SwarmClient;
 use colored::Colorize;
 use std::sync::Arc;
 
@@ -12,20 +11,16 @@ pub async fn run() -> Result<(), String> {
     let identity = identity_store::get_identity()?;
     let our_addr = identity.evm_address();
 
-    let client = Arc::new(SwarmClient::new(identity));
-    client.clone().start_sync_daemon();
-
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
+    let bundle = NetworkBundle::global();
+    let pool = RelayPool::global();
+    pool.ensure_fresh(&bundle.rpc_http).await;
+    let relays = pool.snapshot().await;
 
     let transport_name = client.transport.active_transport_name().await;
     let mode = client.transport.get_mode().await;
     let total_unread = client.total_unread().await;
     let contacts = client.conversation_list().await;
-
-    let bundle = NetworkBundle::global();
-    let pool = RelayPool::global();
-    pool.ensure_fresh(&bundle.rpc_http).await;
-    let relays = pool.snapshot().await;
 
     ui::title("Status");
 

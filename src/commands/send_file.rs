@@ -109,23 +109,19 @@ pub async fn run(recipient: &str, file_path: &str) -> Result<(), String> {
     let our_addr = identity.evm_address();
     println!("{}", format!("Sending as {}...", our_addr).dimmed());
 
-    let client = Arc::new(SwarmClient::new(identity));
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
 
-    // Wait for transport
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    client_core::network_bundle::ensure_federated_pools().await;
 
-    // Send the file
+    // Send the file (flushes relay outbox synchronously before returning)
     println!("{}", format!("Encrypting & sending '{}' to {}...", file_name, recipient).yellow());
 
     let (msg_id, metadata) = client
         .send_file(&recipient, &file_data, file_name, mime_type)
         .await
         .map_err(|e| format!("File send failed: {e}"))?;
-
-    // Wait for relay flush
-    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
     println!();
     println!("{}", "╔══════════════════════════════════════════════════╗".green().bold());
@@ -166,13 +162,10 @@ pub async fn run_with_client(client: &Arc<SwarmClient>, recipient: &str, file_pa
 
     println!("  {} {} ({}, {})", "📎".yellow(), file_name.white().bold(), format_size(file_size).dimmed(), mime_type.dimmed());
 
-    let (msg_id, metadata) = client
+    let (_msg_id, metadata) = client
         .send_file(recipient, &file_data, file_name, mime_type)
         .await
         .map_err(|e| format!("File send failed: {e}"))?;
-
-    // Wait for relay flush
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     let time = chrono::Utc::now().format("%H:%M:%S");
     println!(

@@ -85,3 +85,15 @@ pub async fn run(mode_arg: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// Construct a `SwarmClient` honoring persisted transport mode + on-disk Double Ratchet sessions.
+pub fn create_swarm_client(
+    identity: client_core::identity::CipherIdentity,
+) -> client_core::swarm_client::SwarmClient {
+    let mode_str = std::env::var("CIPHER_TRANSPORT_MODE")
+        .ok()
+        .unwrap_or_else(|| load_config().transport_mode);
+    let mode = client_core::transport::TransportMode::from_config_str(&mode_str);
+    let session_dir = crate::identity_store::cipher_dir().join("sessions");
+    client_core::swarm_client::SwarmClient::with_mode(identity, mode).with_session_dir(session_dir)
+}
+

@@ -10,6 +10,7 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Nonce,
 };
+use ed25519_dalek::{Signature, Signer, SigningKey as Ed25519SigningKey, Verifier, VerifyingKey as Ed25519VerifyingKey};
 use hkdf::Hkdf;
 use hmac::Hmac;
 use hmac::Mac;
@@ -89,6 +90,55 @@ pub struct PrekeyBundle {
     pub signature: Vec<u8>,
 }
 
+impl PrekeyBundle {
+    fn prekey_sign_message(identity_key: &[u8; 32], signed_prekey: &[u8; 32]) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(14 + 64);
+        msg.extend_from_slice(b"CipherPrekeyV1");
+        msg.extend_from_slice(identity_key);
+        msg.extend_from_slice(signed_prekey);
+        msg
+    }
+
+    pub fn create_signed(
+        identity: &crate::identity::CipherIdentity,
+        signed_prekey: [u8; 32],
+        one_time_prekey: Option<[u8; 32]>,
+    ) -> Self {
+        let identity_key = *identity.x25519_public_key().as_bytes();
+        let msg = Self::prekey_sign_message(&identity_key, &signed_prekey);
+        let signature = identity
+            .ed25519_signing_key()
+            .sign(&msg)
+            .to_bytes()
+            .to_vec();
+        Self {
+            identity_key,
+            signed_prekey,
+            one_time_prekey,
+            signature,
+        }
+    }
+
+    pub fn verify(&self, ed25519_public: &[u8; 32]) -> Result<(), CipherError> {
+        let vk = Ed25519VerifyingKey::from_bytes(ed25519_public)
+            .map_err(|e| CipherError::Identity(format!("Invalid Ed25519 public key: {e}")))?;
+        let sig = Signature::from_slice(&self.signature)
+            .map_err(|e| CipherError::Identity(format!("Invalid prekey signature: {e}")))?;
+        let msg = Self::prekey_sign_message(&self.identity_key, &self.signed_prekey);
+        vk.verify(&msg, &sig)
+            .map_err(|e| CipherError::Identity(format!("Prekey signature verification failed: {e}")))
+    }
+}
+
+/// Wire payload carried in `MessageType::KeyExchange` to bootstrap responder's X3DH + Double Ratchet.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct X3dhHandshakeHeader {
+    pub sender_identity_x25519: [u8; 32],
+    pub ephemeral_public: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub one_time_prekey: Option<[u8; 32]>,
+}
+
 /// Result of an X3DH key agreement — shared secret for Double Ratchet init.
 pub struct X3DHResult {
     /// Shared secret (32 bytes) — input to Double Ratchet
@@ -149,6 +199,37 @@ pub fn x3dh_initiate(
         shared_secret,
         ephemeral_public: *ephemeral_public.as_bytes(),
     })
+}
+
+/// Perform X3DH as the responder (Bob) matching `x3dh_initiate`.
+pub fn x3dh_respond(
+    our_identity: &X25519Secret,
+    our_signed_prekey: &X25519Secret,
+    our_one_time_prekey: Option<&X25519Secret>,
+    their_identity_public: &[u8; 32],
+    their_ephemeral_public: &[u8; 32],
+) -> Result<[u8; 32], CipherError> {
+    let their_identity = X25519PublicKey::from(*their_identity_public);
+    let their_ephemeral = X25519PublicKey::from(*their_ephemeral_public);
+
+    // Mirror DH1..DH4 identically to x3dh_initiate
+    let dh1 = our_signed_prekey.diffie_hellman(&their_identity);
+    let dh2 = our_identity.diffie_hellman(&their_ephemeral);
+    let dh3 = our_signed_prekey.diffie_hellman(&their_ephemeral);
+
+    let mut combined = Vec::with_capacity(96 + 32);
+    combined.extend_from_slice(dh1.as_bytes());
+    combined.extend_from_slice(dh2.as_bytes());
+    combined.extend_from_slice(dh3.as_bytes());
+
+    if let Some(otpk_secret) = our_one_time_prekey {
+        let dh4 = otpk_secret.diffie_hellman(&their_ephemeral);
+        combined.extend_from_slice(dh4.as_bytes());
+    }
+
+    let shared_secret = hkdf_derive(&combined, b"CipherX3DH", b"x3dh-shared-secret")?;
+    combined.zeroize();
+    Ok(shared_secret)
 }
 
 // ─────────────────────────────────────────────────────────
@@ -341,6 +422,52 @@ impl DoubleRatchet {
         key.copy_from_slice(&message_key_bytes);
         Ok(key)
     }
+
+    /// Whether the sending chain has been initialized and can encrypt outbound messages.
+    pub fn can_send(&self) -> bool {
+        self.chain_key_send != [0u8; 32]
+    }
+
+    /// Serialize ratchet state for persisted CLI/mobile sessions.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CipherError> {
+        let snap = DoubleRatchetSnapshot {
+            root_key: self.root_key,
+            chain_key_send: self.chain_key_send,
+            chain_key_recv: self.chain_key_recv,
+            dh_secret: self.dh_secret.to_bytes(),
+            their_dh_public: *self.their_dh_public.as_bytes(),
+            send_counter: self.send_counter,
+            recv_counter: self.recv_counter,
+        };
+        serde_json::to_vec(&snap)
+            .map_err(|e| CipherError::Encryption(format!("Serialize ratchet state: {e}")))
+    }
+
+    /// Restore ratchet state from serialized bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CipherError> {
+        let snap: DoubleRatchetSnapshot = serde_json::from_slice(bytes)
+            .map_err(|e| CipherError::Encryption(format!("Deserialize ratchet state: {e}")))?;
+        Ok(Self {
+            root_key: snap.root_key,
+            chain_key_send: snap.chain_key_send,
+            chain_key_recv: snap.chain_key_recv,
+            dh_secret: X25519Secret::from(snap.dh_secret),
+            their_dh_public: X25519PublicKey::from(snap.their_dh_public),
+            send_counter: snap.send_counter,
+            recv_counter: snap.recv_counter,
+        })
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DoubleRatchetSnapshot {
+    root_key: [u8; 32],
+    chain_key_send: [u8; 32],
+    chain_key_recv: [u8; 32],
+    dh_secret: [u8; 32],
+    their_dh_public: [u8; 32],
+    send_counter: u64,
+    recv_counter: u64,
 }
 
 impl Drop for DoubleRatchet {
@@ -418,5 +545,48 @@ mod tests {
 
         assert_eq!(key1, key2); // Deterministic
         assert_ne!(key1, key3); // Different inputs → different keys
+    }
+
+    #[test]
+    fn test_x3dh_initiate_respond_and_bidirectional_ratchet() {
+        let alice_id = crate::identity::CipherIdentity::generate().unwrap();
+        let bob_id = crate::identity::CipherIdentity::generate().unwrap();
+
+        let bob_signed_secret = crate::peer_directory::derive_signed_prekey(&bob_id);
+        let bob_signed_pub = x25519_dalek::PublicKey::from(&bob_signed_secret);
+        let bob_bundle =
+            PrekeyBundle::create_signed(&bob_id, *bob_signed_pub.as_bytes(), None);
+        bob_bundle
+            .verify(bob_id.ed25519_public_key().as_bytes())
+            .unwrap();
+
+        let init = x3dh_initiate(alice_id.x25519_secret_key(), &bob_bundle).unwrap();
+        let resp_secret = x3dh_respond(
+            bob_id.x25519_secret_key(),
+            &bob_signed_secret,
+            None,
+            alice_id.x25519_public_key().as_bytes(),
+            &init.ephemeral_public,
+        )
+        .unwrap();
+        assert_eq!(init.shared_secret, resp_secret);
+
+        let mut alice_ratchet =
+            DoubleRatchet::init_sender(init.shared_secret, bob_signed_pub);
+        let mut bob_ratchet = DoubleRatchet::init_receiver(resp_secret, bob_signed_secret);
+
+        // Alice -> Bob
+        let m1 = alice_ratchet.encrypt(b"hello bob").unwrap();
+        assert_eq!(bob_ratchet.decrypt(&m1).unwrap(), b"hello bob");
+
+        // Bob -> Alice (triggers DH ratchet step on Alice)
+        let m2 = bob_ratchet.encrypt(b"hello alice").unwrap();
+        assert_eq!(alice_ratchet.decrypt(&m2).unwrap(), b"hello alice");
+
+        // Snapshot roundtrip preserves session across process restarts
+        let saved = alice_ratchet.to_bytes().unwrap();
+        let mut alice_restored = DoubleRatchet::from_bytes(&saved).unwrap();
+        let m3 = alice_restored.encrypt(b"persisted turn").unwrap();
+        assert_eq!(bob_ratchet.decrypt(&m3).unwrap(), b"persisted turn");
     }
 }

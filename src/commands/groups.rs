@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,7 +202,7 @@ pub async fn run(action: &str, args: &[String]) -> Result<(), String> {
             println!();
             println!("  {} Broadcasting encrypted message to {} group members...", "👥".cyan(), other_members.len());
 
-            let client = Arc::new(SwarmClient::new(identity));
+            let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
             let mut delivered = 0;
             let group_prefix = format!("[Group: {}] {}", group.name, message);
 

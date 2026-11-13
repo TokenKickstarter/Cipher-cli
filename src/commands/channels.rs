@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,7 +154,7 @@ pub async fn run(action: &str, args: &[String]) -> Result<(), String> {
             println!("  {} Broadcasting post #{} to {} subscribers of '{}'...", "📢".cyan(), post_id, subs.len(), channel_name);
 
             // Send to external subscribers
-            let client = Arc::new(SwarmClient::new(identity));
+            let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
             let broadcast_msg = format!("[Channel: {}] {}", channel_name, text);
             let mut sent_count = 0;
 

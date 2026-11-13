@@ -6,10 +6,24 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use futures_util::future::join_all;
 use log::{debug, info, warn};
 use tokio::sync::Mutex;
 
 use crate::error::CipherError;
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_max_idle_per_host(32)
+            .pool_idle_timeout(Duration::from_secs(60))
+            .tcp_nodelay(true)
+            .connect_timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
 
 static GLOBAL: OnceLock<Arc<NetworkBundle>> = OnceLock::new();
 static GLOBAL_POOL: OnceLock<Arc<RelayPool>> = OnceLock::new();
@@ -72,7 +86,7 @@ impl NetworkBundle {
         GLOBAL.get_or_init(Self::load).clone()
     }
 
-    fn fallback() -> Self {
+    pub fn fallback() -> Self {
         Self {
             version: 1,
             bundle_id: "cipher-network-fallback-v1".into(),
@@ -135,19 +149,25 @@ pub fn fetch_response_is_mailbox_api(body: &str) -> bool {
     false
 }
 
-fn probe_mailbox_base_sync(base: &str) -> bool {
+async fn probe_mailbox_base_async(base: &str) -> bool {
     if !endpoint_is_mailbox_http(base) {
         return false;
     }
     let url = format!("{}/fetch", base.trim_end_matches('/'));
     let body = r#"{"recipient_id":"0000000000000000000000000000000000000000000000000000000000000000"}"#;
-    match ureq::post(&url)
-        .set("Content-Type", "application/json")
+    match shared_http_client()
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body)
         .timeout(Duration::from_secs(3))
-        .send_string(body)
+        .send()
+        .await
     {
-        Ok(resp) => fetch_response_is_mailbox_api(&resp.into_string().unwrap_or_default()),
-        Err(_) => false,
+        Ok(resp) if resp.status().is_success() => {
+            let text = resp.text().await.unwrap_or_default();
+            fetch_response_is_mailbox_api(&text)
+        }
+        _ => false,
     }
 }
 
@@ -200,7 +220,7 @@ pub struct SignalPool {
 impl SignalPool {
     const RANK_INTERVAL: Duration = Duration::from_secs(120);
 
-    fn new_from_bundle(bundle: &NetworkBundle) -> Self {
+    pub fn new_from_bundle(bundle: &NetworkBundle) -> Self {
         let urls = normalize_ws_urls(bundle.signal_ws.clone());
         if !urls.is_empty() {
             info!("[SignalPool] {} bootstrap WebSocket(s)", urls.len());
@@ -227,6 +247,9 @@ impl SignalPool {
                 urls.push(u);
                 added += 1;
             }
+        }
+        if added > 0 {
+            *self.last_rank.write().await = None;
         }
         added
     }
@@ -301,20 +324,19 @@ impl SignalPool {
             return;
         }
 
-        let mut scored: Vec<(u64, String)> = Vec::new();
-        for url in urls {
+        let probe_futures = urls.into_iter().map(|url| async move {
             let probe = signal_ws_to_health_probe(&url);
             let ms = if let Some(health) = probe {
-                let health = health.clone();
                 let start = Instant::now();
-                let ok = tokio::task::spawn_blocking(move || {
-                    ureq::get(&health)
-                        .timeout(Duration::from_secs(2))
-                        .call()
-                        .is_ok()
-                })
-                .await
-                .unwrap_or(false);
+                let ok = match shared_http_client()
+                    .get(&health)
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp.status().is_success(),
+                    Err(_) => false,
+                };
                 if ok {
                     start.elapsed().as_millis() as u64
                 } else {
@@ -323,8 +345,10 @@ impl SignalPool {
             } else {
                 u64::MAX / 2
             };
-            scored.push((ms, url));
-        }
+            (ms, url)
+        });
+
+        let mut scored: Vec<(u64, String)> = join_all(probe_futures).await;
         scored.sort_by_key(|(ms, _)| *ms);
         let ordered: Vec<String> = scored.into_iter().map(|(_, u)| u).collect();
         *self.ranked.write().await = ordered;
@@ -345,14 +369,17 @@ impl SignalPool {
 /// Mutable pool of HTTP relay bases (store/fetch/ack + discovery).
 pub struct RelayPool {
     bases: tokio::sync::RwLock<Vec<String>>,
+    ranked: tokio::sync::RwLock<Vec<String>>,
+    last_rank: tokio::sync::RwLock<Option<Instant>>,
     last_refresh: tokio::sync::RwLock<Option<Instant>>,
     refresh_lock: Mutex<()>,
 }
 
 impl RelayPool {
     const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+    const RANK_INTERVAL: Duration = Duration::from_secs(120);
 
-    fn new_from_bundle(bundle: &NetworkBundle) -> Self {
+    pub fn new_from_bundle(bundle: &NetworkBundle) -> Self {
         let bases = NetworkBundle::normalize_http_bases(bundle.http_relays.clone());
         if bases.is_empty() {
             info!(
@@ -367,6 +394,8 @@ impl RelayPool {
         }
         Self {
             bases: tokio::sync::RwLock::new(bases),
+            ranked: tokio::sync::RwLock::new(Vec::new()),
+            last_rank: tokio::sync::RwLock::new(None),
             last_refresh: tokio::sync::RwLock::new(None),
             refresh_lock: Mutex::new(()),
         }
@@ -433,6 +462,9 @@ impl RelayPool {
                 added += 1;
             }
         }
+        if added > 0 {
+            *self.last_rank.write().await = None;
+        }
         added
     }
 
@@ -451,17 +483,23 @@ impl RelayPool {
         timeout_secs: u64,
     ) -> Option<String> {
         let url = format!("{}{path}", base.trim_end_matches('/'));
-        let result = tokio::task::spawn_blocking(move || {
-            ureq::post(&url)
-                .set("Content-Type", "application/json")
-                .timeout(std::time::Duration::from_secs(timeout_secs))
-                .send_string(&body)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(resp)) => resp.into_string().ok(),
-            _ => None,
+        match shared_http_client()
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .timeout(Duration::from_secs(timeout_secs))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+            Ok(resp) => {
+                debug!("[RelayPool] POST {url} returned HTTP {}", resp.status());
+                None
+            }
+            Err(e) => {
+                debug!("[RelayPool] POST {url} failed: {e}");
+                None
+            }
         }
     }
 
@@ -477,52 +515,48 @@ impl RelayPool {
         let bases = self.ranked_mailbox_bases().await;
         for base in bases {
             let url = format!("{base}{path}");
-            let body_clone = body.clone();
-            let post_url = url.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                ureq::post(&post_url)
-                    .set("Content-Type", "application/json")
-                    .timeout(std::time::Duration::from_secs(timeout_secs))
-                    .send_string(&body_clone)
-            })
-            .await;
-
-            match result {
-                Ok(Ok(resp)) => {
-                    let text = resp.into_string().unwrap_or_default();
-                    return Some((base, text));
+            match shared_http_client()
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body.clone())
+                .timeout(Duration::from_secs(timeout_secs))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(text) = resp.text().await {
+                        return Some((base, text));
+                    }
                 }
-                Ok(Err(e)) => {
-                    debug!("[RelayPool] POST {url} failed: {e}");
+                Ok(resp) => {
+                    debug!("[RelayPool] POST {url} returned HTTP {}", resp.status());
                 }
                 Err(e) => {
-                    debug!("[RelayPool] POST task error for {url}: {e}");
+                    debug!("[RelayPool] POST {url} failed: {e}");
                 }
             }
         }
         None
     }
 
-    /// GET `{base}{path}` from each relay; returns all successful bodies.
+    /// GET `{base}{path}` from all relays concurrently; returns all successful bodies.
     pub async fn get_json_all(&self, path: &str, timeout_secs: u64) -> Vec<(String, String)> {
         let bases = self.bases.read().await.clone();
-        let mut out = Vec::new();
-        for base in bases {
+        let futures = bases.into_iter().map(|base| async move {
             let url = format!("{base}{path}");
-            let result = tokio::task::spawn_blocking(move || {
-                ureq::get(&url)
-                    .timeout(std::time::Duration::from_secs(timeout_secs))
-                    .call()
-            })
-            .await;
-
-            if let Ok(Ok(resp)) = result {
-                if let Ok(text) = resp.into_string() {
-                    out.push((base, text));
+            match shared_http_client()
+                .get(&url)
+                .timeout(Duration::from_secs(timeout_secs))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    resp.text().await.ok().map(|text| (base, text))
                 }
+                _ => None,
             }
-        }
-        out
+        });
+        join_all(futures).await.into_iter().flatten().collect()
     }
 
     /// Map on-chain `endpoint` (HTTPS URL or libp2p multiaddr) to Cipher HTTP relay base.
@@ -555,37 +589,42 @@ impl RelayPool {
         ip.map(|host| format!("http://{host}:{port}"))
     }
 
-    /// Merge relay bases from `tks_listSwarmValidators` on any reachable TKS RPC.
+    /// Merge relay bases from `tks_listSwarmValidators` on any reachable TKS RPC concurrently.
     async fn refresh_from_chain(&self, rpc_http: &[String]) -> usize {
-        let mut found = Vec::new();
-        for rpc in rpc_http {
-            let rpc = rpc.trim().trim_end_matches('/');
-            if rpc.is_empty() {
-                continue;
-            }
-            let body = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "tks_listSwarmValidators",
-                "params": [],
-                "id": 1
-            })
-            .to_string();
-            let rpc_owned = rpc.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                ureq::post(&rpc_owned)
-                    .set("Content-Type", "application/json")
-                    .timeout(std::time::Duration::from_secs(12))
-                    .send_string(&body)
-            })
-            .await;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "tks_listSwarmValidators",
+            "params": [],
+            "id": 1
+        })
+        .to_string();
 
-            let Ok(Ok(resp)) = result else {
-                debug!("[RelayPool] tks_listSwarmValidators failed on {rpc}");
-                continue;
-            };
-            let Ok(text) = resp.into_string() else {
-                continue;
-            };
+        let futures = rpc_http.iter().filter_map(|rpc| {
+            let rpc = rpc.trim().trim_end_matches('/').to_string();
+            if rpc.is_empty() {
+                return None;
+            }
+            let body = body.clone();
+            Some(async move {
+                match shared_http_client()
+                    .post(&rpc)
+                    .header("Content-Type", "application/json")
+                    .body(body)
+                    .timeout(Duration::from_secs(12))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
+                    _ => {
+                        debug!("[RelayPool] tks_listSwarmValidators failed on {rpc}");
+                        None
+                    }
+                }
+            })
+        });
+
+        let mut found = Vec::new();
+        for text in join_all(futures).await.into_iter().flatten() {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
                 continue;
             };
@@ -627,6 +666,8 @@ impl RelayPool {
         let chain_hints = self.refresh_from_chain(rpc_http).await;
         let discovery_hints = self.refresh_from_discovery().await;
         *self.last_refresh.write().await = Some(Instant::now());
+        // Force fresh concurrent RTT ranking during scheduled/explicit network refreshes.
+        *self.last_rank.write().await = None;
         let pool_size = self.len().await;
 
         let signal_pool = SignalPool::global();
@@ -644,7 +685,7 @@ impl RelayPool {
         }
     }
 
-    /// Mailbox-capable relay bases (excludes shard ingest), RTT-ranked via fast `/fetch` probe.
+    /// Mailbox-capable relay bases (excludes shard ingest), cached and concurrently RTT-ranked.
     pub async fn ranked_mailbox_bases(&self) -> Vec<String> {
         let bases: Vec<String> = self
             .snapshot()
@@ -652,28 +693,39 @@ impl RelayPool {
             .into_iter()
             .filter(|b| endpoint_is_mailbox_http(b))
             .collect();
-        if bases.is_empty() {
+        if bases.is_empty() || bases.len() == 1 {
             return bases;
         }
-        if bases.len() == 1 {
-            return bases;
+
+        let cache_fresh = {
+            let last = self.last_rank.read().await;
+            last.map(|t| t.elapsed() <= Self::RANK_INTERVAL)
+                .unwrap_or(false)
+        };
+        if cache_fresh {
+            let cached = self.ranked.read().await.clone();
+            if cached.len() == bases.len() {
+                return cached;
+            }
         }
-        let mut scored: Vec<(u64, String)> = Vec::new();
-        for base in bases {
-            let b = base.clone();
+
+        let probe_futures = bases.into_iter().map(|base| async move {
             let start = Instant::now();
-            let ok = tokio::task::spawn_blocking(move || probe_mailbox_base_sync(&b))
-                .await
-                .unwrap_or(false);
+            let ok = probe_mailbox_base_async(&base).await;
             let ms = if ok {
                 start.elapsed().as_millis() as u64
             } else {
                 u64::MAX / 2
             };
-            scored.push((ms, base));
-        }
+            (ms, base)
+        });
+
+        let mut scored: Vec<(u64, String)> = join_all(probe_futures).await;
         scored.sort_by_key(|(ms, _)| *ms);
-        scored.into_iter().map(|(_, b)| b).collect()
+        let ordered: Vec<String> = scored.into_iter().map(|(_, b)| b).collect();
+        *self.ranked.write().await = ordered.clone();
+        *self.last_rank.write().await = Some(Instant::now());
+        ordered
     }
 
     /// Parallel POST `/fetch` on all mailbox relays (3s each); returns successful responses.
@@ -685,25 +737,18 @@ impl RelayPool {
         let rpcs = NetworkBundle::global().rpc_http.clone();
         self.ensure_fresh(&rpcs).await;
         let bases = self.ranked_mailbox_bases().await;
-        let mut handles = Vec::new();
-        for base in bases {
+        let futures = bases.into_iter().map(|base| {
             let body = body.clone();
-            handles.push(tokio::spawn(async move {
+            async move {
                 let text = Self::post_to_base(&base, "/fetch", body, timeout_secs).await?;
                 if fetch_response_is_mailbox_api(&text) {
                     Some((base, text))
                 } else {
                     None
                 }
-            }));
-        }
-        let mut out = Vec::new();
-        for h in handles {
-            if let Ok(Some(pair)) = h.await {
-                out.push(pair);
             }
-        }
-        out
+        });
+        join_all(futures).await.into_iter().flatten().collect()
     }
 
     /// Pull extra relay URLs from `GET /discovery` on known peers (TKS cipher-relay format).
@@ -777,5 +822,63 @@ mod tests {
             Some("http://203.0.113.10:4002".into())
         );
         assert!(RelayPool::endpoint_to_http_relay("").is_none());
+    }
+
+    #[tokio::test]
+    async fn ranked_mailbox_bases_caches_probes_until_merge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn spawn_mock_relay(counter: Arc<AtomicUsize>) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 1024];
+                        let _ = sock.read(&mut buf).await;
+                        let body = r#"{"Chunks":[]}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        let hits_a = Arc::new(AtomicUsize::new(0));
+        let hits_b = Arc::new(AtomicUsize::new(0));
+        let base_a = spawn_mock_relay(hits_a.clone()).await;
+        let base_b = spawn_mock_relay(hits_b.clone()).await;
+
+        let bundle = super::NetworkBundle {
+            version: 1,
+            bundle_id: "test".into(),
+            http_relays: vec![base_a.clone(), base_b.clone()],
+            signal_ws: vec![],
+            rpc_http: vec![],
+            iroh_relays: vec![],
+            notes: None,
+        };
+        let pool = RelayPool::from_bundle(&bundle);
+
+        let first = pool.ranked_mailbox_bases().await;
+        assert_eq!(first.len(), 2);
+        let probes_after_first = hits_a.load(Ordering::Relaxed) + hits_b.load(Ordering::Relaxed);
+        assert_eq!(probes_after_first, 2);
+
+        // Second call hits cache with zero extra HTTP probes.
+        let second = pool.ranked_mailbox_bases().await;
+        assert_eq!(second.len(), 2);
+        assert_eq!(
+            hits_a.load(Ordering::Relaxed) + hits_b.load(Ordering::Relaxed),
+            2
+        );
     }
 }

@@ -163,6 +163,16 @@ pub struct DirectTransport {
 impl DirectTransport {
     /// Create a new direct transport with the given config and relay pool.
     pub fn new(peer_id: String, config: DirectTransportConfig, relay_pool: Arc<RelayPool>) -> Self {
+        Self::new_with_notify(peer_id, config, relay_pool, Arc::new(tokio::sync::Notify::new()))
+    }
+
+    /// Create a new direct transport sharing an incoming wake notifier with `TransportRouter`.
+    pub fn new_with_notify(
+        peer_id: String,
+        config: DirectTransportConfig,
+        relay_pool: Arc<RelayPool>,
+        notify_incoming: Arc<tokio::sync::Notify>,
+    ) -> Self {
         let (incoming_tx, incoming_rx) = mpsc::channel(1000);
 
         Self {
@@ -180,7 +190,7 @@ impl DirectTransport {
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             running: Arc::new(RwLock::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
-            notify_incoming: Arc::new(tokio::sync::Notify::new()),
+            notify_incoming,
         }
     }
 
@@ -332,6 +342,7 @@ impl DirectTransport {
         }
 
         if any {
+            self.notify_incoming.notify_waiters();
             crate::ffi::notify_dart();
         }
     }
@@ -391,6 +402,8 @@ impl DirectTransport {
         let _ = self.incoming_tx.send(data.clone()).await;
         let mut inbox = self.inbox.write().await;
         inbox.unread.push(data);
+        drop(inbox);
+        self.notify_incoming.notify_waiters();
     }
 
     /// Receive the next message (async, waits for message).

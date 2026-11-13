@@ -3,7 +3,6 @@
 use colored::Colorize;
 use std::sync::Arc;
 use client_core::message::MessageType;
-use client_core::swarm_client::SwarmClient;
 use crate::identity_store;
 
 pub async fn run(follow: bool, interval: u64) -> Result<(), String> {
@@ -17,7 +16,7 @@ pub async fn run(follow: bool, interval: u64) -> Result<(), String> {
     };
     println!("  {} Listening as {}...", "📡".dimmed(), short.cyan());
 
-    let client = Arc::new(SwarmClient::new(identity));
+    let client = Arc::new(crate::commands::mode::create_swarm_client(identity));
     let client_clone = client.clone();
     client_clone.start_sync_daemon();
 
@@ -26,8 +25,6 @@ pub async fn run(follow: bool, interval: u64) -> Result<(), String> {
     let poll_sender = client_core::transport::direct::DefaultSender {
         direct: client.transport.direct.clone(),
     };
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     loop {
         client
@@ -54,9 +51,14 @@ pub async fn run(follow: bool, interval: u64) -> Result<(), String> {
             break;
         }
 
-        // Show waiting indicator
-        print!("{}", ".".dimmed());
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval)).await;
+        if !client.has_pending_inbox().await {
+            print!("{}", ".".dimmed());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            tokio::select! {
+                _ = client.inbox_notify.notified() => {}
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(interval)) => {}
+            }
+        }
     }
 
     println!();
