@@ -262,8 +262,9 @@ impl PeerDirectory {
         let raw = serde_json::to_vec(&bundle)
             .map_err(|e| CipherError::Network(format!("Serialize peer bundle: {e}")))?;
 
+        let mailbox = peer_directory_mailbox(&bundle.evm_address);
         let chunk = serde_json::json!({
-            "recipient_id": peer_directory_mailbox(&bundle.evm_address),
+            "recipient_id": mailbox,
             "message_id": format!("peer-bundle-{}", bundle.evm_address),
             "ciphertext": raw,
             "stored_at": now,
@@ -271,7 +272,16 @@ impl PeerDirectory {
         })
         .to_string();
 
-        if let Some((base, _)) = pool.post_json_failover("/store", chunk, 5).await {
+        if let Some((base, _)) = pool
+            .post_store_json(
+                &mailbox,
+                chunk,
+                &raw,
+                Some(identity.secp256k1_signing_key()),
+                5,
+            )
+            .await
+        {
             info!(
                 "[PeerDir] Published verified EndpointId + PrekeyBundle to {}",
                 base

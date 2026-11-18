@@ -24,6 +24,15 @@ pub fn sealed_mailbox(address: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Derive an unlinkable per-contact mailbox ID from a contact-specific subkey EVM address.
+pub fn contact_mailbox_from_subkey_evm(sub_evm_address: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"cipher-contact-mailbox-v1:");
+    hasher.update(sub_evm_address.trim().to_lowercase().as_bytes());
+    format!("contact-v1:{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WsState {
     Disconnected,

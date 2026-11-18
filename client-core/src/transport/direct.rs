@@ -160,6 +160,10 @@ pub struct DirectTransport {
     pub notify_incoming: Arc<tokio::sync::Notify>,
     /// Optional wallet secp256k1 signing key for authenticated `/fetch` and `/ack`
     auth_key: Option<Arc<k256::ecdsa::SigningKey>>,
+    /// Per-peer unlinkable `contact-v1:...` delivery mailboxes received from contacts over E2EE
+    contact_send_mailboxes: Arc<RwLock<HashMap<String, String>>>,
+    /// Our own unlinkable `contact-v1:...` mailboxes + subkeys derived per contact for receiving
+    contact_recv_mailboxes: Arc<RwLock<HashMap<String, Arc<k256::ecdsa::SigningKey>>>>,
 }
 
 impl DirectTransport {
@@ -194,6 +198,8 @@ impl DirectTransport {
             notify: Arc::new(tokio::sync::Notify::new()),
             notify_incoming,
             auth_key: None,
+            contact_send_mailboxes: Arc::new(RwLock::new(HashMap::new())),
+            contact_recv_mailboxes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -207,6 +213,65 @@ impl DirectTransport {
         &self.relay_pool
     }
 
+    pub async fn set_contact_send_mailbox(&self, peer_evm: &str, contact_mailbox: &str) {
+        let clean = contact_mailbox.trim().to_ascii_lowercase();
+        if !clean.starts_with("contact-v1:") {
+            return;
+        }
+        self.contact_send_mailboxes
+            .write()
+            .await
+            .insert(peer_evm.trim().to_ascii_lowercase(), clean);
+    }
+
+    pub async fn register_contact_recv(
+        &self,
+        contact_mailbox: String,
+        subkey: k256::ecdsa::SigningKey,
+    ) {
+        let clean = contact_mailbox.trim().to_ascii_lowercase();
+        if !clean.starts_with("contact-v1:") {
+            return;
+        }
+        self.contact_recv_mailboxes
+            .write()
+            .await
+            .insert(clean, Arc::new(subkey));
+    }
+
+    /// Synchronously seed contact send/recv state during initialization (before tasks run).
+    pub(crate) fn seed_contact_state_blocking(
+        &self,
+        sends: &HashMap<String, String>,
+        recvs: Vec<(String, k256::ecdsa::SigningKey)>,
+    ) {
+        if let Ok(mut w) = self.contact_send_mailboxes.try_write() {
+            for (k, v) in sends {
+                let clean = v.trim().to_ascii_lowercase();
+                if clean.starts_with("contact-v1:") {
+                    w.insert(k.trim().to_ascii_lowercase(), clean);
+                }
+            }
+        }
+        if let Ok(mut w) = self.contact_recv_mailboxes.try_write() {
+            for (mbox, sk) in recvs {
+                let clean = mbox.trim().to_ascii_lowercase();
+                if clean.starts_with("contact-v1:") {
+                    w.insert(clean, Arc::new(sk));
+                }
+            }
+        }
+    }
+
+    pub async fn target_mailbox_for_peer(&self, recipient: &str) -> String {
+        let key = recipient.trim().to_ascii_lowercase();
+        if let Some(mbox) = self.contact_send_mailboxes.read().await.get(&key).cloned() {
+            mbox
+        } else {
+            sealed_mailbox(recipient)
+        }
+    }
+
     /// Flush pending outbox messages to the relay via JSON REST API.
     pub async fn flush_outbox(&self, _sender: &dyn RelaySender) -> Result<FlushStats, CipherError> {
         let mut outbox = self.outbox.write().await;
@@ -215,9 +280,9 @@ impl DirectTransport {
 
         for (recipient, messages) in pending {
             let mut failed_messages = Vec::new();
+            let recipient_id = self.target_mailbox_for_peer(&recipient).await;
 
             for mut msg in messages {
-                let recipient_id = sealed_mailbox(&recipient);
                 let message_id = uuid::Uuid::new_v4().to_string();
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -234,7 +299,15 @@ impl DirectTransport {
 
                 let body = payload.to_string();
                 let pool = self.relay_pool.clone();
-                let stored = pool.post_json_failover("/store", body, 30).await;
+                let stored = pool
+                    .post_store_json(
+                        &recipient_id,
+                        body,
+                        &msg.message,
+                        self.auth_key.as_deref(),
+                        30,
+                    )
+                    .await;
 
                 match stored {
                     Some((_base, resp_text)) if store_response_ok(&resp_text) => {
@@ -281,80 +354,89 @@ impl DirectTransport {
         Ok(stats)
     }
 
-    /// Poll relay for messages addressed to us via JSON REST API.
+    /// Poll relay for messages addressed to our request mailbox + unlinkable contact mailboxes.
     pub async fn poll_incoming(&self, _sender: &dyn RelaySender) {
         use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-        let recipient_id = sealed_mailbox(&self.peer_id);
-        let rid = recipient_id.clone();
-        let fetch_body = serde_json::json!({ "recipient_id": rid }).to_string();
-        let fetch_auth = self
-            .auth_key
-            .as_deref()
-            .and_then(|k| crate::identity::sign_relay_auth_with_key(k, "fetch", &rid).ok());
+        let mut targets: Vec<(String, Option<Arc<k256::ecdsa::SigningKey>>)> =
+            vec![(sealed_mailbox(&self.peer_id), self.auth_key.clone())];
+        {
+            let extra = self.contact_recv_mailboxes.read().await;
+            for (mbox, sk) in extra.iter() {
+                targets.push((mbox.clone(), Some(sk.clone())));
+            }
+        }
+
         let pool = self.relay_pool.clone();
-        let responses = pool
-            .post_fetch_parallel_with_auth(fetch_body, fetch_auth, 3)
-            .await;
         let mut any = false;
 
-        for (base, resp_text) in responses {
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_text) else {
-                continue;
-            };
-            let chunks_opt = parsed
-                .get("Chunks")
-                .and_then(|v| v.as_array())
-                .or_else(|| parsed.get("messages").and_then(|v| v.as_array()));
+        for (recipient_id, key_opt) in targets {
+            let fetch_body = serde_json::json!({ "recipient_id": recipient_id }).to_string();
+            let fetch_auth = key_opt.as_deref().and_then(|k| {
+                crate::identity::sign_relay_auth_with_key(k, "fetch", &recipient_id).ok()
+            });
+            let responses = pool
+                .post_fetch_parallel_with_auth(fetch_body, fetch_auth, 3)
+                .await;
 
-            let Some(messages) = chunks_opt else { continue };
-            if messages.is_empty() {
-                continue;
-            }
-
-            any = true;
-            info!(
-                "[Transport] 📬 {} message(s) from relay {}",
-                messages.len(),
-                base
-            );
-            let mut ack_ids: Vec<String> = Vec::new();
-
-            for msg in messages {
-                let mid = msg["message_id"].as_str().unwrap_or("").to_string();
-                if !mid.is_empty() {
-                    ack_ids.push(mid);
-                }
-
-                let bytes_opt = if let Some(arr) = msg["ciphertext"].as_array() {
-                    Some(
-                        arr.iter()
-                            .filter_map(|v| v.as_u64().map(|b| b as u8))
-                            .collect::<Vec<u8>>(),
-                    )
-                } else if let Some(data_b64) = msg["data"].as_str() {
-                    BASE64.decode(data_b64).ok()
-                } else {
-                    None
+            for (base, resp_text) in responses {
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&resp_text) else {
+                    continue;
                 };
+                let chunks_opt = parsed
+                    .get("Chunks")
+                    .and_then(|v| v.as_array())
+                    .or_else(|| parsed.get("messages").and_then(|v| v.as_array()));
 
-                if let Some(ciphertext) = bytes_opt {
-                    let mut inbox = self.inbox.write().await;
-                    inbox.unread.push(ciphertext);
+                let Some(messages) = chunks_opt else { continue };
+                if messages.is_empty() {
+                    continue;
                 }
-            }
 
-            if !ack_ids.is_empty() {
-                let ack_body = serde_json::json!({
-                    "recipient_id": recipient_id,
-                    "message_ids": ack_ids,
-                })
-                .to_string();
-                let ack_auth = self.auth_key.as_deref().and_then(|k| {
-                    crate::identity::sign_relay_auth_with_key(k, "ack", &recipient_id).ok()
-                });
-                let _ = RelayPool::post_to_base_with_auth(&base, "/ack", ack_body, ack_auth, 5)
-                    .await;
+                any = true;
+                info!(
+                    "[Transport] 📬 {} message(s) from relay {}",
+                    messages.len(),
+                    base
+                );
+                let mut ack_ids: Vec<String> = Vec::new();
+
+                for msg in messages {
+                    let mid = msg["message_id"].as_str().unwrap_or("").to_string();
+                    if !mid.is_empty() {
+                        ack_ids.push(mid);
+                    }
+
+                    let bytes_opt = if let Some(arr) = msg["ciphertext"].as_array() {
+                        Some(
+                            arr.iter()
+                                .filter_map(|v| v.as_u64().map(|b| b as u8))
+                                .collect::<Vec<u8>>(),
+                        )
+                    } else if let Some(data_b64) = msg["data"].as_str() {
+                        BASE64.decode(data_b64).ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(ciphertext) = bytes_opt {
+                        let mut inbox = self.inbox.write().await;
+                        inbox.unread.push(ciphertext);
+                    }
+                }
+
+                if !ack_ids.is_empty() {
+                    let ack_body = serde_json::json!({
+                        "recipient_id": recipient_id,
+                        "message_ids": ack_ids,
+                    })
+                    .to_string();
+                    let ack_auth = key_opt.as_deref().and_then(|k| {
+                        crate::identity::sign_relay_auth_with_key(k, "ack", &recipient_id).ok()
+                    });
+                    let _ = RelayPool::post_to_base_with_auth(&base, "/ack", ack_body, ack_auth, 5)
+                        .await;
+                }
             }
         }
 

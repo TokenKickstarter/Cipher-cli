@@ -137,6 +137,8 @@ pub struct X3dhHandshakeHeader {
     pub ephemeral_public: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub one_time_prekey: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_contact_mailbox: Option<String>,
 }
 
 /// Result of an X3DH key agreement — shared secret for Double Ratchet init.

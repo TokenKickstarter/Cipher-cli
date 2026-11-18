@@ -29,6 +29,9 @@ static GLOBAL: OnceLock<Arc<NetworkBundle>> = OnceLock::new();
 static GLOBAL_POOL: OnceLock<Arc<RelayPool>> = OnceLock::new();
 static GLOBAL_SIGNAL_POOL: OnceLock<Arc<SignalPool>> = OnceLock::new();
 
+pub const DEFAULT_STORE_POW_BITS: u32 = 18;
+const MAX_ADAPTIVE_POW_BITS: u32 = 24;
+
 /// Counts from the latest `refresh_network` (hints merged, not necessarily unique hosts).
 #[derive(Debug, Clone, Default)]
 pub struct NetworkRefreshStats {
@@ -561,6 +564,102 @@ impl RelayPool {
                 }
                 Err(e) => {
                     debug!("[RelayPool] POST {url} failed: {e}");
+                }
+            }
+        }
+        None
+    }
+
+    /// POST `/store` with `TKS-CIPHER-STORE-V1` signature + adaptive `X-TKS-Pow` Hashcash proof.
+    pub async fn post_store_json(
+        &self,
+        recipient_id: &str,
+        body: String,
+        ciphertext: &[u8],
+        auth_key: Option<&k256::ecdsa::SigningKey>,
+        timeout_secs: u64,
+    ) -> Option<(String, String)> {
+        use sha2::{Digest as _, Sha256};
+
+        let rpcs = NetworkBundle::global().rpc_http.clone();
+        self.ensure_fresh(&rpcs).await;
+        let bases = self.ranked_mailbox_bases().await;
+        let payload_sha256 = hex::encode(Sha256::digest(ciphertext));
+
+        let build_headers = |bits: u32| -> Option<(u64, String, u64)> {
+            let sk = auth_key?;
+            let ts_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let sig = crate::identity::sign_relay_store_with_key_ts(
+                sk,
+                recipient_id,
+                &payload_sha256,
+                ts_ms,
+            )
+            .ok()?;
+            let sender_evm = crate::identity::evm_address_for_key(sk);
+            let nonce = crate::identity::solve_store_pow(
+                &sender_evm,
+                recipient_id,
+                &payload_sha256,
+                ts_ms,
+                bits,
+            );
+            Some((ts_ms, sig, nonce))
+        };
+
+        let mut pow_bits = DEFAULT_STORE_POW_BITS;
+        let mut cached_hdrs = build_headers(pow_bits);
+
+        for base in bases {
+            let url = format!("{base}/store");
+            for attempt in 0..2 {
+                let mut req = shared_http_client()
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(body.clone())
+                    .timeout(Duration::from_secs(timeout_secs));
+                if let Some((ts_ms, ref sig, nonce)) = cached_hdrs {
+                    req = req
+                        .header("X-TKS-Ts", ts_ms.to_string())
+                        .header("X-TKS-Sig", sig.as_str())
+                        .header("X-TKS-Pow", nonce.to_string());
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        if let Ok(text) = resp.text().await {
+                            return Some((base, text));
+                        }
+                        break;
+                    }
+                    Ok(resp)
+                        if attempt == 0
+                            && resp.status().as_u16() == 429
+                            && auth_key.is_some() =>
+                    {
+                        if let Some(req_bits) = resp
+                            .headers()
+                            .get("x-tks-pow-required-bits")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.trim().parse::<u32>().ok())
+                            .filter(|&b| b > pow_bits && b <= MAX_ADAPTIVE_POW_BITS)
+                        {
+                            pow_bits = req_bits;
+                            cached_hdrs = build_headers(pow_bits);
+                            continue;
+                        }
+                        break;
+                    }
+                    Ok(resp) => {
+                        debug!("[RelayPool] POST {url} returned HTTP {}", resp.status());
+                        break;
+                    }
+                    Err(e) => {
+                        debug!("[RelayPool] POST {url} failed: {e}");
+                        break;
+                    }
                 }
             }
         }

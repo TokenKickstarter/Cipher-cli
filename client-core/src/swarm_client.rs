@@ -180,10 +180,95 @@ impl SwarmClient {
         Self::from_router(identity, transport)
     }
 
-    /// Enable persistent on-disk storage for Double Ratchet sessions (used by CLI).
+    /// Enable persistent on-disk storage for Double Ratchet sessions and unlinkable contact mailboxes.
     pub fn with_session_dir(mut self, dir: PathBuf) -> Self {
+        let mut sends: HashMap<String, String> = dir
+            .join("contacts_send.json")
+            .pipe_read_json()
+            .unwrap_or_default();
+        let mut recv_peers: Vec<String> = dir
+            .join("contacts_recv_peers.json")
+            .pipe_read_json()
+            .unwrap_or_default();
+
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let s = name.to_string_lossy();
+                if let Some(stem) = s.strip_suffix(".ratchet.json") {
+                    if is_valid_evm_address(stem)
+                        && !recv_peers.iter().any(|p| p.eq_ignore_ascii_case(stem))
+                    {
+                        recv_peers.push(stem.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+
+        sends.retain(|k, v| is_valid_evm_address(k) && v.trim().starts_with("contact-v1:"));
+        let mut recvs = Vec::new();
+        for peer in &recv_peers {
+            if is_valid_evm_address(peer) {
+                if let Ok((subkey, _sub_evm, mbox)) = self.identity.derive_contact_subkey(peer) {
+                    recvs.push((mbox, subkey));
+                }
+            }
+        }
+        self.transport.direct.seed_contact_state_blocking(&sends, recvs);
         self.session_dir = Some(dir);
         self
+    }
+
+    async fn register_contact_mailbox_for_peer(&self, peer_evm: &str) -> Option<String> {
+        let clean_peer = peer_evm.trim().to_ascii_lowercase();
+        if !is_valid_evm_address(&clean_peer) {
+            return None;
+        }
+        let (subkey, _sub_evm, mbox) = self.identity.derive_contact_subkey(&clean_peer).ok()?;
+        self.transport
+            .direct
+            .register_contact_recv(mbox.clone(), subkey)
+            .await;
+
+        if let Some(ref dir) = self.session_dir {
+            let path = dir.join("contacts_recv_peers.json");
+            let mut peers: Vec<String> = path.pipe_read_json().unwrap_or_default();
+            if !peers.iter().any(|p| p.eq_ignore_ascii_case(&clean_peer)) {
+                peers.push(clean_peer);
+                let _ = tokio::fs::create_dir_all(dir).await;
+                if let Ok(bytes) = serde_json::to_vec_pretty(&peers) {
+                    let _ = tokio::fs::write(&path, bytes).await;
+                }
+            }
+        }
+        Some(mbox)
+    }
+
+    async fn accept_peer_contact_mailbox(&self, peer_evm: &str, contact_mailbox: &str) {
+        let clean_peer = peer_evm.trim().to_ascii_lowercase();
+        let clean_mbox = contact_mailbox.trim().to_ascii_lowercase();
+        if !is_valid_evm_address(&clean_peer)
+            || !clean_mbox.starts_with("contact-v1:")
+            || clean_mbox.len() > 128
+        {
+            return;
+        }
+        self.transport
+            .direct
+            .set_contact_send_mailbox(&clean_peer, &clean_mbox)
+            .await;
+
+        if let Some(ref dir) = self.session_dir {
+            let path = dir.join("contacts_send.json");
+            let mut sends: HashMap<String, String> = path.pipe_read_json().unwrap_or_default();
+            if sends.get(&clean_peer).map(|s| s.as_str()) != Some(clean_mbox.as_str()) {
+                sends.insert(clean_peer, clean_mbox);
+                let _ = tokio::fs::create_dir_all(dir).await;
+                if let Ok(bytes) = serde_json::to_vec_pretty(&sends) {
+                    let _ = tokio::fs::write(&path, bytes).await;
+                }
+            }
+        }
     }
 
     /// Publish our dual-signed `SignedPeerBundle` (Iroh `EndpointId` + X3DH `PrekeyBundle`)
@@ -316,8 +401,8 @@ impl SwarmClient {
 
                 let ws_ok = transport_for_poll.ws_signal.is_connected().await;
                 let delay = if ws_ok {
-                    // WS push is primary; HTTP fetch is offline fallback
-                    tokio::time::Duration::from_secs(20)
+                    // Poll contact-v1 capability mailboxes frequently alongside WS push on sealed mailbox.
+                    tokio::time::Duration::from_secs(4)
                 } else {
                     tokio::time::Duration::from_millis(800)
                 };
@@ -406,10 +491,12 @@ impl SwarmClient {
                     x3dh.shared_secret,
                     x25519_dalek::PublicKey::from(bundle.signed_prekey),
                 );
+                let sender_contact_mailbox = self.register_contact_mailbox_for_peer(recipient).await;
                 let header = X3dhHandshakeHeader {
                     sender_identity_x25519: *self.identity.x25519_public_key().as_bytes(),
                     ephemeral_public: x3dh.ephemeral_public,
                     one_time_prekey: prekey.one_time_prekey,
+                    sender_contact_mailbox,
                 };
                 let header_json = serde_json::to_vec(&header)
                     .map_err(|e| CipherError::Encryption(format!("X3DH header encode: {e}")))?;
@@ -766,6 +853,10 @@ impl SwarmClient {
                                     self.signed_prekey.clone(),
                                 );
                                 self.save_ratchet(&sender, ratchet).await;
+                                if let Some(ref cm) = header.sender_contact_mailbox {
+                                    self.accept_peer_contact_mailbox(&sender, cm).await;
+                                }
+                                let _ = self.register_contact_mailbox_for_peer(&sender).await;
                                 self.record_seen_id(msg_id).await;
                                 debug!("Established X3DH + Double Ratchet session with {}", sender);
 
@@ -870,6 +961,9 @@ impl SwarmClient {
                             // (envelope ID is now unique to pass deduplication)
                             if let Ok(payload_str) = String::from_utf8(msg.payload.clone()) {
                                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(&payload_str) {
+                                    if let Some(cm) = json["contact_mailbox"].as_str() {
+                                        self.accept_peer_contact_mailbox(&sender, cm).await;
+                                    }
                                     if let Some(ref_id_str) = json["receipt_for"].as_str() {
                                         if let Ok(ref_msg_id) = uuid::Uuid::parse_str(ref_id_str) {
                                             // Find this message in ALL conversations and update its status
@@ -1127,12 +1221,14 @@ impl SwarmClient {
 
     // --------- Read Receipt Methods ---------
 
-    /// Send a delivery/read receipt for a specific message.
+    /// Send a delivery/read receipt for a specific message (also attaches our unlinkable `contact-v1` capability).
     pub async fn send_receipt(&self, recipient: &str, msg_id: MessageId, receipt_type: ReceiptType) -> Result<(), CipherError> {
         let session_key = self.derive_temp_session_key(recipient);
+        let contact_mailbox = self.register_contact_mailbox_for_peer(recipient).await;
         let payload_text = serde_json::json!({
             "receipt_for": msg_id.to_string(),
             "type": format!("{:?}", receipt_type),
+            "contact_mailbox": contact_mailbox,
         }).to_string();
         let encrypted = aes_encrypt(&session_key, payload_text.as_bytes())?;
 
@@ -1453,5 +1549,107 @@ mod tests {
 
         let registered_eid = alice.transport.iroh.resolve_endpoint(&bob_addr).await.unwrap();
         assert_eq!(registered_eid, expected_eid);
+    }
+
+    #[tokio::test]
+    async fn test_unlinkable_contact_mailbox_exchange_and_persistence() {
+        let offline_bundle = crate::network_bundle::NetworkBundle::fallback();
+        let empty_relay = RelayPool::from_bundle(&offline_bundle);
+        let empty_signal = Arc::new(SignalPool::new_from_bundle(&offline_bundle));
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let alice_dir = std::env::temp_dir().join(format!("cipher-cap-alice-{ts}"));
+        let bob_dir = std::env::temp_dir().join(format!("cipher-cap-bob-{ts}"));
+
+        let alice_id = CipherIdentity::generate().unwrap();
+        let bob_id = CipherIdentity::generate().unwrap();
+        let alice_addr = alice_id.display_address();
+        let bob_addr = bob_id.display_address();
+
+        let alice = SwarmClient::with_mode_and_pools(
+            alice_id.clone(),
+            TransportMode::Direct,
+            empty_relay.clone(),
+            empty_signal.clone(),
+        )
+        .with_session_dir(alice_dir.clone());
+        let bob = SwarmClient::with_mode_and_pools(
+            bob_id.clone(),
+            TransportMode::Direct,
+            empty_relay.clone(),
+            empty_signal.clone(),
+        )
+        .with_session_dir(bob_dir.clone());
+
+        let bob_bundle = SignedPeerBundle::from_identity(&bob.identity).unwrap();
+        alice.peer_directory.insert_verified(bob_bundle).await.unwrap();
+
+        // Initially Alice targets Bob's public sealed_mailbox (request bucket).
+        assert_eq!(
+            alice.transport.direct.target_mailbox_for_peer(&bob_addr).await,
+            crate::transport::websocket_signal::sealed_mailbox(&bob_addr)
+        );
+
+        // Alice sends first message (with X3dhHandshakeHeader containing Alice's contact_mailbox).
+        alice.send_text(&bob_addr, "first contact").await.unwrap();
+        let first_frames = alice.transport.direct.get_pending(&bob_addr).await;
+        for f in first_frames {
+            bob.transport.direct.push_received(f).await;
+        }
+        bob.process_incoming().await;
+        let _ = bob.receive_all().await;
+
+        // Bob automatically learned Alice's unlinkable contact-v1:* mailbox from X3DH!
+        let expected_alice_box = alice_id.derive_contact_subkey(&bob_addr).unwrap().2;
+        assert_eq!(
+            bob.transport.direct.target_mailbox_for_peer(&alice_addr).await,
+            expected_alice_box
+        );
+
+        // Bob's auto-queued receipt carries Bob's unlinkable contact-v1:* mailbox back to Alice!
+        let bob_receipts = bob.transport.direct.get_pending(&alice_addr).await;
+        assert_eq!(bob_receipts.len(), 1);
+        alice.transport.direct.push_received(bob_receipts[0].clone()).await;
+        alice.process_incoming().await;
+
+        let expected_bob_box = bob_id.derive_contact_subkey(&alice_addr).unwrap().2;
+        assert_eq!(
+            alice.transport.direct.target_mailbox_for_peer(&bob_addr).await,
+            expected_bob_box
+        );
+        assert_ne!(
+            expected_bob_box,
+            crate::transport::websocket_signal::sealed_mailbox(&bob_addr)
+        );
+
+        // Simulate restart: reloaded Alice still routes Bob's messages to Bob's contact-v1 mailbox.
+        let alice_reloaded = SwarmClient::with_mode_and_pools(
+            alice_id,
+            TransportMode::Direct,
+            empty_relay,
+            empty_signal,
+        )
+        .with_session_dir(alice_dir.clone());
+        assert_eq!(
+            alice_reloaded.transport.direct.target_mailbox_for_peer(&bob_addr).await,
+            expected_bob_box
+        );
+
+        let _ = std::fs::remove_dir_all(alice_dir);
+        let _ = std::fs::remove_dir_all(bob_dir);
+    }
+}
+
+trait PipeReadJson {
+    fn pipe_read_json<T: serde::de::DeserializeOwned>(&self) -> Option<T>;
+}
+
+impl PipeReadJson for std::path::PathBuf {
+    fn pipe_read_json<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
+        let bytes = std::fs::read(self).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 }

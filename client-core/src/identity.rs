@@ -258,6 +258,22 @@ impl CipherIdentity {
     pub fn sign_relay_auth(&self, action: &str, mailbox: &str) -> Result<(u64, String), CipherError> {
         sign_relay_auth_with_key(&self.secp256k1_signing, action, mailbox)
     }
+
+    /// Derive our unlinkable per-peer contact subkey + `contact-v1:...` mailbox ID.
+    pub fn derive_contact_subkey(
+        &self,
+        peer_evm: &str,
+    ) -> Result<(K256SigningKey, String, String), CipherError> {
+        derive_contact_subkey_with_key(&self.secp256k1_signing, peer_evm)
+    }
+}
+
+/// Compute lowercase `0x...` EVM address for any secp256k1 signing key.
+pub fn evm_address_for_key(signing_key: &K256SigningKey) -> String {
+    use sha3::{Digest as Sha3Digest, Keccak256};
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let hash = Keccak256::digest(&point.as_bytes()[1..]);
+    format!("0x{}", hex::encode(&hash[12..]))
 }
 
 /// Sign a `TKS-CIPHER-AUTH-V1` mailbox authorization proof using a secp256k1 key.
@@ -286,6 +302,98 @@ pub fn sign_relay_auth_with_key(
     raw[..64].copy_from_slice(&sig.to_bytes());
     raw[64] = rec_id.to_byte();
     Ok((ts_ms, hex::encode(raw)))
+}
+
+/// Sign a `TKS-CIPHER-STORE-V1` proof binding sender key, recipient, ciphertext digest, and timestamp.
+pub fn sign_relay_store_with_key_ts(
+    signing_key: &K256SigningKey,
+    recipient: &str,
+    payload_sha256_hex: &str,
+    ts_ms: u64,
+) -> Result<String, CipherError> {
+    use sha3::{Digest as Sha3Digest, Keccak256};
+
+    let payload = format!(
+        "TKS-CIPHER-STORE-V1\nrecipient:{}\npayload_sha256:{}\nts:{}",
+        recipient.trim().to_ascii_lowercase(),
+        payload_sha256_hex.trim().to_ascii_lowercase(),
+        ts_ms
+    );
+    let digest = Keccak256::digest(payload.as_bytes());
+    let (sig, rec_id) = signing_key
+        .sign_prehash_recoverable(&digest)
+        .map_err(|e| CipherError::Identity(format!("relay store signing failed: {e}")))?;
+    let mut raw = [0u8; 65];
+    raw[..64].copy_from_slice(&sig.to_bytes());
+    raw[64] = rec_id.to_byte();
+    Ok(hex::encode(raw))
+}
+
+/// Solve a Hashcash Proof-of-Work nonce (`X-TKS-Pow`) meeting `required_bits` leading zero bits.
+pub fn solve_store_pow(
+    sender_evm: &str,
+    recipient: &str,
+    payload_sha256_hex: &str,
+    ts_ms: u64,
+    required_bits: u32,
+) -> u64 {
+    use sha2::{Digest as Sha2Digest, Sha256};
+
+    if required_bits == 0 {
+        return 0;
+    }
+    let prefix = format!(
+        "TKS-CIPHER-POW-V1:{}:{}:{}:{}:",
+        sender_evm.trim().to_ascii_lowercase(),
+        recipient.trim().to_ascii_lowercase(),
+        payload_sha256_hex.trim().to_ascii_lowercase(),
+        ts_ms
+    );
+    let mut nonce = 0u64;
+    loop {
+        let mut h = Sha256::new();
+        h.update(prefix.as_bytes());
+        h.update(nonce.to_string().as_bytes());
+        let digest = h.finalize();
+        let mut zbits = 0u32;
+        for &b in digest.iter() {
+            if b == 0 {
+                zbits += 8;
+            } else {
+                zbits += b.leading_zeros();
+                break;
+            }
+        }
+        if zbits >= required_bits {
+            return nonce;
+        }
+        nonce = nonce.wrapping_add(1);
+    }
+}
+
+/// Derive a deterministic unlinkable secp256k1 subkey + `contact-v1:...` mailbox for `peer_evm`.
+pub fn derive_contact_subkey_with_key(
+    base_signing_key: &K256SigningKey,
+    peer_evm: &str,
+) -> Result<(K256SigningKey, String, String), CipherError> {
+    let peer_clean = peer_evm.trim().to_ascii_lowercase();
+    let base_bytes = base_signing_key.to_bytes();
+    for counter in 0u8..=255 {
+        let info = format!("{peer_clean}:{counter}");
+        let derived = crate::encryption::hkdf_derive(
+            base_bytes.as_slice(),
+            b"cipher-contact-subkey-v1",
+            info.as_bytes(),
+        )?;
+        if let Ok(subkey) = K256SigningKey::from_slice(&derived) {
+            let sub_evm = evm_address_for_key(&subkey);
+            let mailbox = crate::transport::websocket_signal::contact_mailbox_from_subkey_evm(&sub_evm);
+            return Ok((subkey, sub_evm, mailbox));
+        }
+    }
+    Err(CipherError::Identity(
+        "Failed to derive contact secp256k1 subkey".into(),
+    ))
 }
 
 impl Drop for CipherIdentity {
@@ -400,5 +508,37 @@ mod tests {
         let h = Keccak256::digest(&pt.as_bytes()[1..65]);
         let recovered = format!("0x{}", hex::encode(&h[12..32]));
         assert_eq!(recovered, evm.to_lowercase());
+    }
+
+    #[test]
+    fn test_contact_subkey_derivation_and_store_pow() {
+        use sha2::{Digest as Sha2Digest, Sha256};
+
+        let alice = CipherIdentity::generate().unwrap();
+        let bob = CipherIdentity::generate().unwrap();
+        let (_, sub1, box1) = alice.derive_contact_subkey(&bob.evm_address()).unwrap();
+        let (_, sub2, box2) = alice.derive_contact_subkey(&bob.evm_address()).unwrap();
+        assert_eq!(sub1, sub2);
+        assert_eq!(box1, box2);
+        assert!(box1.starts_with("contact-v1:"));
+        assert_ne!(sub1, alice.evm_address().to_lowercase());
+
+        let carol = CipherIdentity::generate().unwrap();
+        let (_, _, box_carol) = alice.derive_contact_subkey(&carol.evm_address()).unwrap();
+        assert_ne!(box1, box_carol);
+
+        let payload_sha = hex::encode(Sha256::digest(b"hello-pow"));
+        let ts = 1_700_000_000_000u64;
+        let nonce = solve_store_pow(&alice.evm_address(), &box1, &payload_sha, ts, 8);
+        let msg = format!(
+            "TKS-CIPHER-POW-V1:{}:{}:{}:{}:{}",
+            alice.evm_address().to_lowercase(),
+            box1,
+            payload_sha,
+            ts,
+            nonce
+        );
+        let h = Sha256::digest(msg.as_bytes());
+        assert_eq!(h[0], 0);
     }
 }
