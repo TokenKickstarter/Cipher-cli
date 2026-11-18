@@ -185,14 +185,37 @@ impl TransportRouter {
         relay_pool: Arc<RelayPool>,
         signal_pool: Arc<SignalPool>,
     ) -> Self {
+        Self::new_with_identity_and_pools(
+            peer_id,
+            secret_key,
+            None,
+            initial_mode,
+            relay_pool,
+            signal_pool,
+        )
+    }
+
+    /// Create a transport router with optional secp256k1 key for authenticated relay/WS access.
+    pub fn new_with_identity_and_pools(
+        peer_id: String,
+        secret_key: [u8; 32],
+        auth_key: Option<k256::ecdsa::SigningKey>,
+        initial_mode: TransportMode,
+        relay_pool: Arc<RelayPool>,
+        signal_pool: Arc<SignalPool>,
+    ) -> Self {
         let incoming_notify = Arc::new(Notify::new());
 
-        let direct = Arc::new(direct::DirectTransport::new_with_notify(
+        let mut direct_inner = direct::DirectTransport::new_with_notify(
             peer_id.clone(),
             direct::DirectTransportConfig::default(),
             relay_pool.clone(),
             incoming_notify.clone(),
-        ));
+        );
+        if let Some(ref k) = auth_key {
+            direct_inner = direct_inner.with_auth_key(k.clone());
+        }
+        let direct = Arc::new(direct_inner);
         let iroh = Arc::new(iroh_p2p::IrohTransport::new_with_notify(
             peer_id.clone(),
             secret_key,
@@ -207,11 +230,12 @@ impl TransportRouter {
             nym::NymConfig::default(),
         ));
         let domain_front = Arc::new(domain_front::DomainFrontTransport::new());
-        let ws_signal = Arc::new(websocket_signal::WebSocketSignal::new_with_notify(
+        let ws_signal = Arc::new(websocket_signal::WebSocketSignal::new_with_notify_and_auth(
             peer_id.clone(),
             signal_pool,
             relay_pool.clone(),
             incoming_notify.clone(),
+            auth_key,
         ));
 
         Self {

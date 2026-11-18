@@ -131,7 +131,15 @@ impl SwarmClient {
     pub fn new(identity: CipherIdentity) -> Self {
         let peer_id = identity.display_address();
         let secret_bytes = identity.ed25519_secret_bytes();
-        let transport = TransportRouter::new_with_secret(peer_id, secret_bytes);
+        let auth_key = identity.secp256k1_signing_key().clone();
+        let transport = TransportRouter::new_with_identity_and_pools(
+            peer_id,
+            secret_bytes,
+            Some(auth_key),
+            crate::transport::load_persisted_mode(),
+            RelayPool::global(),
+            SignalPool::global(),
+        );
         Self::from_router(identity, transport)
     }
 
@@ -139,7 +147,15 @@ impl SwarmClient {
     pub fn with_mode(identity: CipherIdentity, mode: TransportMode) -> Self {
         let peer_id = identity.display_address();
         let secret_bytes = identity.ed25519_secret_bytes();
-        let transport = TransportRouter::new_with_mode(peer_id, secret_bytes, mode);
+        let auth_key = identity.secp256k1_signing_key().clone();
+        let transport = TransportRouter::new_with_identity_and_pools(
+            peer_id,
+            secret_bytes,
+            Some(auth_key),
+            mode,
+            RelayPool::global(),
+            SignalPool::global(),
+        );
         Self::from_router(identity, transport)
     }
 
@@ -152,9 +168,11 @@ impl SwarmClient {
     ) -> Self {
         let peer_id = identity.display_address();
         let secret_bytes = identity.ed25519_secret_bytes();
-        let transport = TransportRouter::new_with_mode_and_pools(
+        let auth_key = identity.secp256k1_signing_key().clone();
+        let transport = TransportRouter::new_with_identity_and_pools(
             peer_id,
             secret_bytes,
+            Some(auth_key),
             mode,
             relay_pool,
             signal_pool,

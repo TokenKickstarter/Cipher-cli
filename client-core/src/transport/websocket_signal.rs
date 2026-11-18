@@ -84,10 +84,27 @@ impl WebSocketSignal {
         relay_pool: Arc<crate::network_bundle::RelayPool>,
         incoming_notify: Arc<Notify>,
     ) -> Self {
+        Self::new_with_notify_and_auth(
+            our_address,
+            signal_pool,
+            relay_pool,
+            incoming_notify,
+            None,
+        )
+    }
+
+    pub fn new_with_notify_and_auth(
+        our_address: String,
+        signal_pool: Arc<crate::network_bundle::SignalPool>,
+        relay_pool: Arc<crate::network_bundle::RelayPool>,
+        incoming_notify: Arc<Notify>,
+        auth_key: Option<k256::ecdsa::SigningKey>,
+    ) -> Self {
         let (outgoing_tx, outgoing_rx) = mpsc::channel(500);
         let (incoming_tx, incoming_rx) = mpsc::channel(500);
 
         let sealed_addr = sealed_mailbox(&our_address);
+        let auth_key = auth_key.map(Arc::new);
 
         let ws = Self {
             our_address: our_address.to_lowercase(),
@@ -119,6 +136,7 @@ impl WebSocketSignal {
                 tx,
                 incoming_notify,
                 outgoing_rx,
+                auth_key,
             )
             .await;
         });
@@ -135,6 +153,7 @@ impl WebSocketSignal {
         incoming_tx: mpsc::Sender<Vec<u8>>,
         incoming_notify: Arc<Notify>,
         outgoing_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<String>>>,
+        auth_key: Option<Arc<k256::ecdsa::SigningKey>>,
     ) {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::connect_async_with_config;
@@ -164,8 +183,13 @@ impl WebSocketSignal {
 
             let idx = *ws_index.read().await;
             let base_url = ws_urls[idx % ws_urls.len()].clone();
-            let ws_url = format!("{base_url}?addr={addr}");
-            info!("[WS] Connecting to {ws_url}...");
+            let ws_url = match auth_key.as_deref().and_then(|k| {
+                crate::identity::sign_relay_auth_with_key(k, "ws", &addr).ok()
+            }) {
+                Some((ts, sig)) => format!("{base_url}?addr={addr}&ts={ts}&sig={sig}"),
+                None => format!("{base_url}?addr={addr}"),
+            };
+            info!("[WS] Connecting to {base_url}?addr={addr}...");
             *state.write().await = WsState::Connecting;
 
             let ws_config = WebSocketConfig {
@@ -245,10 +269,15 @@ impl WebSocketSignal {
                                                                 "message_ids": [mid],
                                                             })
                                                             .to_string();
+                                                            let ack_auth = auth_key
+                                                                .as_deref()
+                                                                .and_then(|k| {
+                                                                    crate::identity::sign_relay_auth_with_key(k, "ack", &addr).ok()
+                                                                });
                                                             let pool = relay_pool.clone();
                                                             tokio::spawn(async move {
                                                                 let _ = pool
-                                                                    .post_json_failover("/ack", ack_body, 5)
+                                                                    .post_json_failover_with_auth("/ack", ack_body, ack_auth, 5)
                                                                     .await;
                                                             });
                                                         }

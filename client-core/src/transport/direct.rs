@@ -158,6 +158,8 @@ pub struct DirectTransport {
     pub notify: Arc<tokio::sync::Notify>,
     /// Manual wakeup for incoming polling loop
     pub notify_incoming: Arc<tokio::sync::Notify>,
+    /// Optional wallet secp256k1 signing key for authenticated `/fetch` and `/ack`
+    auth_key: Option<Arc<k256::ecdsa::SigningKey>>,
 }
 
 impl DirectTransport {
@@ -191,7 +193,14 @@ impl DirectTransport {
             running: Arc::new(RwLock::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
             notify_incoming,
+            auth_key: None,
         }
+    }
+
+    /// Attach the secp256k1 wallet signing key so `/fetch` and `/ack` are authenticated.
+    pub fn with_auth_key(mut self, signing_key: k256::ecdsa::SigningKey) -> Self {
+        self.auth_key = Some(Arc::new(signing_key));
+        self
     }
 
     pub fn relay_pool(&self) -> &Arc<RelayPool> {
@@ -279,9 +288,13 @@ impl DirectTransport {
         let recipient_id = sealed_mailbox(&self.peer_id);
         let rid = recipient_id.clone();
         let fetch_body = serde_json::json!({ "recipient_id": rid }).to_string();
+        let fetch_auth = self
+            .auth_key
+            .as_deref()
+            .and_then(|k| crate::identity::sign_relay_auth_with_key(k, "fetch", &rid).ok());
         let pool = self.relay_pool.clone();
         let responses = pool
-            .post_fetch_parallel(fetch_body, 3)
+            .post_fetch_parallel_with_auth(fetch_body, fetch_auth, 3)
             .await;
         let mut any = false;
 
@@ -337,7 +350,11 @@ impl DirectTransport {
                     "message_ids": ack_ids,
                 })
                 .to_string();
-                let _ = RelayPool::post_to_base(&base, "/ack", ack_body, 5).await;
+                let ack_auth = self.auth_key.as_deref().and_then(|k| {
+                    crate::identity::sign_relay_auth_with_key(k, "ack", &recipient_id).ok()
+                });
+                let _ = RelayPool::post_to_base_with_auth(&base, "/ack", ack_body, ack_auth, 5)
+                    .await;
             }
         }
 

@@ -482,15 +482,28 @@ impl RelayPool {
         body: String,
         timeout_secs: u64,
     ) -> Option<String> {
+        Self::post_to_base_with_auth(base, path, body, None, timeout_secs).await
+    }
+
+    pub async fn post_to_base_with_auth(
+        base: &str,
+        path: &str,
+        body: String,
+        auth: Option<(u64, String)>,
+        timeout_secs: u64,
+    ) -> Option<String> {
         let url = format!("{}{path}", base.trim_end_matches('/'));
-        match shared_http_client()
+        let mut req = shared_http_client()
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body)
-            .timeout(Duration::from_secs(timeout_secs))
-            .send()
-            .await
-        {
+            .timeout(Duration::from_secs(timeout_secs));
+        if let Some((ts, sig)) = auth {
+            req = req
+                .header("X-TKS-Ts", ts.to_string())
+                .header("X-TKS-Sig", sig);
+        }
+        match req.send().await {
             Ok(resp) if resp.status().is_success() => resp.text().await.ok(),
             Ok(resp) => {
                 debug!("[RelayPool] POST {url} returned HTTP {}", resp.status());
@@ -510,19 +523,34 @@ impl RelayPool {
         body: String,
         timeout_secs: u64,
     ) -> Option<(String, String)> {
+        self.post_json_failover_with_auth(path, body, None, timeout_secs)
+            .await
+    }
+
+    /// POST JSON to `{base}{path}` with optional `X-TKS-Ts`/`X-TKS-Sig` mailbox auth headers.
+    pub async fn post_json_failover_with_auth(
+        &self,
+        path: &str,
+        body: String,
+        auth: Option<(u64, String)>,
+        timeout_secs: u64,
+    ) -> Option<(String, String)> {
         let rpcs = NetworkBundle::global().rpc_http.clone();
         self.ensure_fresh(&rpcs).await;
         let bases = self.ranked_mailbox_bases().await;
         for base in bases {
             let url = format!("{base}{path}");
-            match shared_http_client()
+            let mut req = shared_http_client()
                 .post(&url)
                 .header("Content-Type", "application/json")
                 .body(body.clone())
-                .timeout(Duration::from_secs(timeout_secs))
-                .send()
-                .await
-            {
+                .timeout(Duration::from_secs(timeout_secs));
+            if let Some((ts, ref sig)) = auth {
+                req = req
+                    .header("X-TKS-Ts", ts.to_string())
+                    .header("X-TKS-Sig", sig.as_str());
+            }
+            match req.send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
                         return Some((base, text));
@@ -734,13 +762,27 @@ impl RelayPool {
         body: String,
         timeout_secs: u64,
     ) -> Vec<(String, String)> {
+        self.post_fetch_parallel_with_auth(body, None, timeout_secs)
+            .await
+    }
+
+    /// Parallel POST `/fetch` with optional `X-TKS-Ts`/`X-TKS-Sig` mailbox auth headers.
+    pub async fn post_fetch_parallel_with_auth(
+        &self,
+        body: String,
+        auth: Option<(u64, String)>,
+        timeout_secs: u64,
+    ) -> Vec<(String, String)> {
         let rpcs = NetworkBundle::global().rpc_http.clone();
         self.ensure_fresh(&rpcs).await;
         let bases = self.ranked_mailbox_bases().await;
         let futures = bases.into_iter().map(|base| {
             let body = body.clone();
+            let auth = auth.clone();
             async move {
-                let text = Self::post_to_base(&base, "/fetch", body, timeout_secs).await?;
+                let text =
+                    Self::post_to_base_with_auth(&base, "/fetch", body, auth, timeout_secs)
+                        .await?;
                 if fetch_response_is_mailbox_api(&text) {
                     Some((base, text))
                 } else {

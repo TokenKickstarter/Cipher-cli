@@ -253,6 +253,39 @@ impl CipherIdentity {
             display_address: self.display_address(),
         }
     }
+
+    /// Sign a `TKS-CIPHER-AUTH-V1` mailbox authorization proof (`action`: `fetch`, `ack`, `register`, `ws`).
+    pub fn sign_relay_auth(&self, action: &str, mailbox: &str) -> Result<(u64, String), CipherError> {
+        sign_relay_auth_with_key(&self.secp256k1_signing, action, mailbox)
+    }
+}
+
+/// Sign a `TKS-CIPHER-AUTH-V1` mailbox authorization proof using a secp256k1 key.
+pub fn sign_relay_auth_with_key(
+    signing_key: &K256SigningKey,
+    action: &str,
+    mailbox: &str,
+) -> Result<(u64, String), CipherError> {
+    use sha3::{Digest as Sha3Digest, Keccak256};
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let payload = format!(
+        "TKS-CIPHER-AUTH-V1\naction:{}\nmailbox:{}\nts:{}",
+        action.trim(),
+        mailbox.trim().to_ascii_lowercase(),
+        ts_ms
+    );
+    let digest = Keccak256::digest(payload.as_bytes());
+    let (sig, rec_id) = signing_key
+        .sign_prehash_recoverable(&digest)
+        .map_err(|e| CipherError::Identity(format!("relay auth signing failed: {e}")))?;
+    let mut raw = [0u8; 65];
+    raw[..64].copy_from_slice(&sig.to_bytes());
+    raw[64] = rec_id.to_byte();
+    Ok((ts_ms, hex::encode(raw)))
 }
 
 impl Drop for CipherIdentity {
@@ -345,5 +378,27 @@ mod tests {
     fn test_invalid_mnemonic() {
         let result = CipherIdentity::from_mnemonic("invalid words here");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sign_relay_auth_recovers_evm_address() {
+        use k256::ecdsa::{RecoveryId, Signature};
+        use sha3::{Digest as Sha3Digest, Keccak256};
+
+        let id = CipherIdentity::generate().unwrap();
+        let evm = id.evm_address();
+        let (ts, sig_hex) = id.sign_relay_auth("fetch", &evm).unwrap();
+        let sig_bytes = hex::decode(&sig_hex).unwrap();
+        assert_eq!(sig_bytes.len(), 65);
+
+        let payload = format!("TKS-CIPHER-AUTH-V1\naction:fetch\nmailbox:{}\nts:{ts}", evm.to_lowercase());
+        let digest = Keccak256::digest(payload.as_bytes());
+        let rec_id = RecoveryId::from_byte(sig_bytes[64]).unwrap();
+        let sig = Signature::from_slice(&sig_bytes[..64]).unwrap();
+        let vk = K256VerifyingKey::recover_from_prehash(&digest, &sig, rec_id).unwrap();
+        let pt = vk.to_encoded_point(false);
+        let h = Keccak256::digest(&pt.as_bytes()[1..65]);
+        let recovered = format!("0x{}", hex::encode(&h[12..32]));
+        assert_eq!(recovered, evm.to_lowercase());
     }
 }
