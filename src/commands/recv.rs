@@ -92,7 +92,7 @@ fn print_message(msg: &client_core::message::CipherMessage) {
                 .join("cipher-files");
             std::fs::create_dir_all(&download_dir).ok();
 
-            let safe_name = meta.file_name.replace('/', "_").replace('\\', "_");
+            let safe_name = crate::ui::sanitize_attachment_filename(&meta.file_name);
             let dest = download_dir.join(&safe_name);
 
             // Avoid overwriting — add suffix if exists

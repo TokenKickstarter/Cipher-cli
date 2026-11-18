@@ -120,7 +120,7 @@ pub async fn run() -> Result<(), String> {
                             .unwrap_or_else(|| std::path::PathBuf::from("."))
                             .join("cipher-files");
                         std::fs::create_dir_all(&download_dir).ok();
-                        let safe_name = meta.file_name.replace('/', "_").replace('\\', "_");
+                        let safe_name = crate::ui::sanitize_attachment_filename(&meta.file_name);
                         let dest = download_dir.join(&safe_name);
                         let _ = std::fs::write(&dest, &msg.payload);
 

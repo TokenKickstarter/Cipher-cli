@@ -20,22 +20,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::CipherError;
 
-const DEBUG_FILE: &str =
-    "/Users/indigo/Downloads/mobile-app/ninjaswap-mobile-design/SYNC_DEBUG.txt";
-
 pub fn log_to_file(msg: &str) {
+    let Ok(debug_path) = std::env::var("CIPHER_SYNC_DEBUG_LOG") else {
+        return;
+    };
+    if debug_path.trim().is_empty() {
+        return;
+    }
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(DEBUG_FILE)
+        .open(debug_path.trim())
     {
         let _ = writeln!(
             file,
             "[{}] {}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
             msg
         );
     }
