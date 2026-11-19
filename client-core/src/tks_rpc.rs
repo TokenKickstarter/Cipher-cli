@@ -49,6 +49,38 @@ pub fn local_rpc_http() -> String {
     crate::network_bundle::NetworkBundle::global().primary_rpc()
 }
 
+/// All TKS JSON-RPC HTTP URLs from the bundle (for failover).
+pub fn all_rpc_http() -> Vec<String> {
+    crate::network_bundle::NetworkBundle::global().rpc_http.clone()
+}
+
+/// Try a JSON-RPC call against each RPC endpoint in order, return first success.
+/// Silently skips unreachable endpoints; only errors if ALL fail.
+pub fn rpc_call_with_failover(
+    method: &str,
+    params: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, CipherError> {
+    let endpoints = all_rpc_http();
+    if endpoints.is_empty() {
+        return Err(CipherError::Network("No RPC endpoints configured".into()));
+    }
+    let mut last_err = CipherError::Network("All RPC endpoints failed".into());
+    for endpoint in &endpoints {
+        let client = TksRpcClient::new(endpoint);
+        match client.call(method, params.clone()) {
+            Ok(v) => {
+                log::debug!("[TKS RPC] Success via {endpoint}");
+                return Ok(v);
+            }
+            Err(e) => {
+                log::debug!("[TKS RPC] Endpoint {endpoint} failed: {e} — trying next");
+                last_err = e;
+            }
+        }
+    }
+    Err(last_err)
+}
+
 /// Primary TKS JSON-RPC WebSocket URL (derived from bundle HTTP list).
 pub fn local_rpc_ws() -> String {
     let http = local_rpc_http();

@@ -357,7 +357,9 @@ impl WebSocketSignal {
                     *state.write().await = WsState::Reconnecting;
                 }
                 Err(e) => {
-                    error!("[WS] Connection failed: {e}");
+                    // Downgraded to debug — WS is optional (HTTP relay is the fallback).
+                    // Connection errors are expected when signal relays are unavailable.
+                    debug!("[WS] Connection failed (will retry): {e}");
                     *state.write().await = WsState::Reconnecting;
                 }
             }

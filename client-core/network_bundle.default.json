@@ -1,16 +1,24 @@
 {
   "version": 1,
-  "bundle_id": "cipher-network-federated-v1",
+  "bundle_id": "cipher-network-federated-v2",
   "http_relays": [
-    "https://relay.tokenkickstarter.com"
+    "https://relay.tokenkickstarter.com",
+    "https://relay.tksscan.com",
+    "https://relay.cipher.llc"
   ],
   "signal_ws": [
     "wss://signal.tokenkickstarter.com/ws",
-    "wss://relay.tokenkickstarter.com/ws"
+    "wss://signal.tksscan.com/ws",
+    "wss://signal.cipher.llc/ws",
+    "wss://relay.tokenkickstarter.com/ws",
+    "wss://relay.tksscan.com/ws"
   ],
   "rpc_http": [
     "https://rpc.tokenkickstarter.com",
+    "https://rpc.tksscan.com",
+    "https://rpc.cipher.llc",
     "http://127.0.0.1:9944"
   ],
-  "notes": "Bootstrap mirrors (optional if your infra is down). Runtime directory = tks_listSwarmValidators + GET /discovery + libp2p gossip merged into RelayPool/SignalPool. Override with CIPHER_NETWORK_BUNDLE."
+  "iroh_relays": [],
+  "notes": "Federated bootstrap bundle v2. Tries rpc.tokenkickstarter.com → rpc.tksscan.com → rpc.cipher.llc → localhost:9944 in order. WS signal is optional — HTTP relay is always the fallback. Override with CIPHER_NETWORK_BUNDLE env var."
 }

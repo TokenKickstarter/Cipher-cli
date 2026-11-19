@@ -465,54 +465,48 @@ impl UsernameRegistry {
 
     /// Submit registration to TKS node (FREE — no gas).
     ///
-    /// In production, this sends a WebSocket RPC call:
-    /// ```json
-    /// {
-    ///   "method": "tks_identity_register",
-    ///   "params": {
-    ///     "username": "alice",
-    ///     "address": "0x...",
-    ///     "signature": "ed25519_sig_of(register:alice:0x...)"
-    ///   }
-    /// }
-    /// ```
-    ///
-    /// The TKS node:
-    /// 1. Verifies the Ed25519 signature (proves address ownership)
-    /// 2. Checks username availability in its local store
-    /// 3. Stores the record in off-chain identity storage
-    /// 4. Gossips the record to all peer TKS nodes via libp2p gossipsub
-    /// 5. Returns success — NO GAS COST, NO TRANSACTION FEE
+    /// Tries all RPC endpoints from the network bundle in order.
+    /// Falls back to the next endpoint automatically if one is unreachable.
     async fn submit_to_tks_node(&self, record: &UsernameRecord) -> Result<(), CipherError> {
-        let default_node = tks_rpc_endpoints()
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "http://127.0.0.1:9944".into());
-        let node = record
-            .registered_via
-            .as_deref()
-            .unwrap_or(default_node.as_str());
-        log::info!(
-            "[TKS] Registering @{} → {} on {} (FREE, no gas)",
-            record.username, record.address, node
-        );
+        let endpoints = tks_rpc_endpoints();
+        if endpoints.is_empty() {
+            return Err(CipherError::Network("No TKS RPC endpoints configured".into()));
+        }
 
-        // Use HTTP endpoint (convert ws:// → http://)
-        let http_endpoint = node
-            .replace("ws://", "http://")
-            .replace("wss://", "https://");
+        let mut last_err = CipherError::Network("All TKS RPC endpoints failed".into());
 
-        let rpc = crate::tks_rpc::TksRpcClient::new(&http_endpoint);
+        for endpoint in &endpoints {
+            let http_endpoint = endpoint
+                .replace("ws://", "http://")
+                .replace("wss://", "https://");
 
-        // We bypass the flaky is_connected() pre-flight check which fails randomly on iOS
-        // and let do_on_chain_register fail naturally if the node is truly unreachable.
+            log::debug!(
+                "[TKS] Trying RPC endpoint {} for @{} registration",
+                http_endpoint, record.username
+            );
 
-        self.do_on_chain_register(&rpc, &record.username).await?;
+            let rpc = crate::tks_rpc::TksRpcClient::new(&http_endpoint);
 
-        // Update node sync status
-        self.update_node_sync(node, 1).await;
+            match self.do_on_chain_register(&rpc, &record.username).await {
+                Ok(()) => {
+                    log::info!(
+                        "[TKS] ✓ Registered @{} via {}",
+                        record.username, http_endpoint
+                    );
+                    self.update_node_sync(&http_endpoint, 1).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    log::debug!(
+                        "[TKS] Endpoint {} failed: {} — trying next",
+                        http_endpoint, e
+                    );
+                    last_err = e;
+                }
+            }
+        }
 
-        Ok(())
+        Err(last_err)
     }
 
     async fn do_on_chain_register(
@@ -521,14 +515,14 @@ impl UsernameRegistry {
         username: &str,
     ) -> Result<(), CipherError> {
         let msg = format!("[TKS] do_on_chain_register: starting for @{}", username);
-        println!("{}", msg);
+        log::debug!("{}", msg);
         crate::tks_rpc::log_to_file(&msg);
         
         // First check if already registered on-chain
         match rpc.query_username(username) {
             Ok(Some(existing)) => {
                 let msg = format!("[TKS] @{} already registered on-chain to {}", username, existing);
-                println!("{}", msg);
+                log::debug!("{}", msg);
                 crate::tks_rpc::log_to_file(&msg);
                 log::info!("{}", msg);
                 
@@ -549,12 +543,12 @@ impl UsernameRegistry {
             }
             Ok(None) => {
                 let msg = format!("[TKS] @{} NOT on-chain, proceeding to register", username);
-                println!("{}", msg);
+                log::debug!("{}", msg);
                 crate::tks_rpc::log_to_file(&msg);
             }
             Err(e) => {
                 let msg = format!("[TKS] query_username error for @{}: {}", username, e);
-                println!("{}", msg);
+                log::debug!("{}", msg);
                 crate::tks_rpc::log_to_file(&msg);
                 // Continue to try registration anyway
             }
@@ -562,37 +556,35 @@ impl UsernameRegistry {
 
         // Get the ECDSA secret key from our identity
         let msg = format!("[TKS] our_identity is_some: {}", self.our_identity.is_some());
-        println!("{}", msg);
+        log::debug!("{}", msg);
         crate::tks_rpc::log_to_file(&msg);
 
         if let Some(identity) = &self.our_identity {
             let secret_key = identity.secp256k1_signing_key().clone();
             let msg = format!("[TKS] Got signing key, calling submit_name_register for @{}", username);
-            println!("{}", msg);
+            log::debug!("{}", msg);
             crate::tks_rpc::log_to_file(&msg);
 
             // Submit real signed extrinsic
             match rpc.submit_name_register(username, &secret_key) {
                 Ok(tx_hash) => {
                     let msg = format!("[TKS] ✅ Successfully registered @{} on-chain! Hash: {}", username, tx_hash);
-                    println!("{}", msg);
+                    log::debug!("{}", msg);
                     crate::tks_rpc::log_to_file(&msg);
                     log::info!("{}", msg);
                     Ok(())
                 }
                 Err(e) => {
                     let msg = format!("[TKS] ❌ Failed to register @{} on-chain: {}", username, e);
-                    println!("{}", msg);
+                    log::debug!("{}", msg);
                     crate::tks_rpc::log_to_file(&msg);
-                    log::error!("{}", msg);
                     Err(e)
                 }
             }
         } else {
-            let msg = format!("[TKS] ❌ Cannot sign: Identity not available in registry!");
-            println!("{}", msg);
+            let msg = "[TKS] ❌ Cannot sign: Identity not available in registry!".to_string();
+            log::debug!("{}", msg);
             crate::tks_rpc::log_to_file(&msg);
-            log::warn!("{}", msg);
             Err(CipherError::Network("Identity not available for signing".into()))
         }
     }

@@ -212,9 +212,9 @@ fn print_banner() {
 
 #[tokio::main]
 async fn main() {
-    // Default to WARN level to suppress noisy transport/crypto logs
-    // Users can set RUST_LOG=info or RUST_LOG=debug for verbose output
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+    // Default to ERROR level — only real fatal errors show in the interactive shell.
+    // Set RUST_LOG=warn, RUST_LOG=info, or RUST_LOG=debug for verbose diagnostics.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
         .format_timestamp_secs()
         .init();
 
